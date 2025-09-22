@@ -28,7 +28,6 @@ unsigned long last_update = 0;
 int animation_frame = 0;
 
 void setup() {
-  // 初始化串口
   Serial.begin(115200);
   
   // 设置按钮引脚为输入，启用内部上拉电阻
