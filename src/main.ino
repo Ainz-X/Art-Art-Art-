@@ -50,7 +50,8 @@ enum GameState {
   TEAM_SELECT,  // 队伍选择
   WAITING,      // 等待开始
   SEARCHING,    // 搜索设备中
-  PLAYING       // 游戏进行中
+  PLAYING,      // 游戏进行中
+  VICTORY       // 胜利状态
 };
 
 enum PlayerTeam {
@@ -73,12 +74,32 @@ unsigned long gameStartTime = 0;
 unsigned long lastCaptureTime = 0;
 bool canCapture = true;
 
+// ====== 防守机制 ======
+bool isBeingCaptured = false;         // 是否正在被抓捕
+unsigned long captureStartTime = 0;   // 被抓捕开始时间
+const unsigned long CAPTURE_WINDOW = 3000;  // 53秒防守窗口
+String capturingPlayer = "";          // 正在抓捕我的玩家MAC
+PlayerTeam capturingTeam = TEAM_NEUTRAL;  // 抓捕者的队伍
+
+bool canDefend = true;                // 是否可以防守
+unsigned long lastDefendTime = 0;     // 上次防守时间
+const unsigned long DEFEND_COOLDOWN = 30000; // 防守冷却30秒
+
+// ====== 胜利状态 ======
+unsigned long victoryTime = 0;
+PlayerTeam winningTeam = TEAM_NEUTRAL;
+
 // ====== 按键状态 ======
 bool lastButton1 = false;
 bool lastButton2 = false;
 unsigned long lastButton1Press = 0;
 unsigned long lastButton2Press = 0;
 const unsigned long DEBOUNCE_TIME = 50;
+
+// 长按重置功能
+unsigned long button1PressStartTime = 0;
+bool button1Pressing = false;
+const unsigned long LONG_PRESS_TIME = 3000; // 3秒长按
 
 struct Packet { 
   char magic[4]; 
@@ -107,6 +128,7 @@ float rssiToDistanceMeters(int rssi, float txPower = -59.0f, float n = 2.0f);
 int distanceToEdgeLen(float d);
 uint16_t colorForTeam(PlayerTeam team);
 void drawEdgeBar(int side, int len, uint16_t color);
+bool checkVictory();
 // ====== 小工具 ======
 String macToString(const uint8_t mac[6]) {
   char buf[18];
@@ -162,6 +184,24 @@ void prunePeers() {
   for (auto &k : dead) peers.erase(k);
 }
 
+// 检查是否所有玩家都是同一队伍（胜利条件）
+bool checkVictory() {
+  // 至少需要2个玩家（自己+至少1个其他玩家）
+  if (peers.size() < 1) {
+    return false;
+  }
+  
+  // 检查所有在线玩家是否都是同一队伍
+  for (auto &kv : peers) {
+    if (kv.second.team != myTeam) {
+      return false; // 发现不同队伍的玩家
+    }
+  }
+  
+  // 所有玩家都是同一队伍
+  return true;
+}
+
 // ====== 游戏逻辑 ======
 void handleGameLogic() {
   unsigned long now = millis();
@@ -169,6 +209,25 @@ void handleGameLogic() {
   // 检查冷却时间
   if (!canCapture && (now - lastCaptureTime) > COOLDOWN_TIME_MS) {
     canCapture = true;
+  }
+  
+  // 检查防守冷却时间
+  if (!canDefend && (now - lastDefendTime) > DEFEND_COOLDOWN) {
+    canDefend = true;
+    Serial.println("防守冷却结束，可以再次防守");
+  }
+  
+  // 检查被抓捕状态超时
+  if (isBeingCaptured && (now - captureStartTime) > CAPTURE_WINDOW) {
+    // 5秒内没有防守，被成功抓捕
+    PlayerTeam oldTeam = myTeam;
+    myTeam = capturingTeam;
+    isBeingCaptured = false;
+    Serial.printf("❌ 未能防守！队伍从 %d 变为 %d\n", oldTeam, myTeam);
+    
+    // 强制冷却
+    canCapture = false;
+    lastCaptureTime = now;
   }
   
   // 搜索阶段显示进度 (每2秒更新一次)
@@ -180,45 +239,96 @@ void handleGameLogic() {
     lastSearchUpdate = now;
   }
   
-  // 按键处理
-  if (readButton(BUTTON1_PIN, lastButton1, lastButton1Press)) {
-    switch(gameState) {
-      case TEAM_SELECT:
-        // 确认选择的队伍，进入等待状态
-        gameState = WAITING;
-        Serial.printf("已选择队伍: %d (", selectedTeam);
-        switch(selectedTeam) {
-          case TEAM_RED: Serial.print("红色"); break;
-          case TEAM_GREEN: Serial.print("绿色"); break;
-          case TEAM_BLUE: Serial.print("蓝色"); break;
-          case TEAM_YELLOW: Serial.print("黄色"); break;
-          default: Serial.print("未知"); break;
-        }
-        Serial.println(") - 按按键1开始游戏");
-        break;
-        
-      case WAITING:
-        gameState = SEARCHING;
-        gameStartTime = now;
-        myTeam = assignTeamByMac(selfMac);
-        Serial.printf("开始搜索设备... 我的队伍: %d (颜色: ", myTeam);
-        switch(myTeam) {
-          case TEAM_RED: Serial.print("红色"); break;
-          case TEAM_GREEN: Serial.print("绿色"); break;
-          case TEAM_BLUE: Serial.print("蓝色"); break;
-          case TEAM_YELLOW: Serial.print("黄色"); break;
-          default: Serial.print("未知"); break;
-        }
-        Serial.println(")");
-        break;
-        
-      case SEARCHING:
-      case PLAYING:
+  // 按键1处理 - 支持长按重置
+  // 注意：根据实际硬件，可能需要反转逻辑
+  // 如果不按时进度条增加，说明逻辑反了，需要改为 == HIGH
+  bool button1Current = digitalRead(BUTTON1_PIN) == HIGH;  // 反转逻辑！
+  
+  // 调试：检测按钮状态变化
+  static bool lastDebugState = false;
+  if (button1Current != lastDebugState) {
+    Serial.printf("[DEBUG] 按钮1状态变化: %s (digitalRead=%d)\n", 
+                  button1Current ? "按下" : "释放", 
+                  digitalRead(BUTTON1_PIN));
+    lastDebugState = button1Current;
+  }
+  
+  // 检测按键1按下（从false变为true）
+  if (button1Current && !button1Pressing) {
+    button1Pressing = true;
+    button1PressStartTime = now;
+    Serial.println("[DEBUG] 开始计时长按");
+  }
+  // 检测按键1释放（从true变为false）
+  else if (!button1Current && button1Pressing) {
+    button1Pressing = false;
+    unsigned long pressDuration = now - button1PressStartTime;
+    Serial.printf("[DEBUG] 按钮释放，持续时长: %.2f秒\n", pressDuration / 1000.0f);
+    
+    // 根据按压时长和游戏状态处理
+    if (gameState == SEARCHING || gameState == PLAYING || gameState == VICTORY) {
+      // 在游戏中或胜利状态需要长按3秒才能重置
+      if (pressDuration >= LONG_PRESS_TIME) {
         gameState = TEAM_SELECT;
         myTeam = TEAM_NEUTRAL;
         peers.clear();
-        Serial.println("游戏结束 - 重新选择队伍");
-        break;
+        Serial.println("长按重置 - 游戏结束，重新选择队伍");
+      } else {
+        Serial.printf("需要长按3秒才能重置 (当前: %.1f秒)\n", pressDuration / 1000.0f);
+      }
+    } else {
+      // 在其他状态下，短按即可
+      if (pressDuration < LONG_PRESS_TIME) {
+        switch(gameState) {
+          case TEAM_SELECT:
+            // 确认选择的队伍，进入等待状态
+            gameState = WAITING;
+            Serial.printf("已选择队伍: %d (", selectedTeam);
+            switch(selectedTeam) {
+              case TEAM_RED: Serial.print("红色"); break;
+              case TEAM_GREEN: Serial.print("绿色"); break;
+              case TEAM_BLUE: Serial.print("蓝色"); break;
+              case TEAM_YELLOW: Serial.print("黄色"); break;
+              default: Serial.print("未知"); break;
+            }
+            Serial.println(") - 按按键1开始游戏");
+            break;
+            
+          case WAITING:
+            gameState = SEARCHING;
+            gameStartTime = now;
+            myTeam = assignTeamByMac(selfMac);
+            Serial.printf("开始搜索设备... 我的队伍: %d (颜色: ", myTeam);
+            switch(myTeam) {
+              case TEAM_RED: Serial.print("红色"); break;
+              case TEAM_GREEN: Serial.print("绿色"); break;
+              case TEAM_BLUE: Serial.print("蓝色"); break;
+              case TEAM_YELLOW: Serial.print("黄色"); break;
+              default: Serial.print("未知"); break;
+            }
+            Serial.println(")");
+            break;
+        }
+      }
+    }
+  }
+  
+  // 长按过程中显示进度提示
+  if (button1Pressing && (gameState == SEARCHING || gameState == PLAYING || gameState == VICTORY)) {
+    unsigned long pressDuration = now - button1PressStartTime;
+    static unsigned long lastProgressPrint = 0;
+    if (pressDuration >= LONG_PRESS_TIME) {
+      // 已达到3秒，等待释放
+      if (now - lastProgressPrint > 200) {
+        Serial.println(">>> 释放按键以重置游戏 <<<");
+        lastProgressPrint = now;
+      }
+    } else {
+      // 显示进度
+      if (now - lastProgressPrint > 500) {
+        Serial.printf("长按重置中... %.1f/3.0秒\n", pressDuration / 1000.0f);
+        lastProgressPrint = now;
+      }
     }
   }
   
@@ -242,16 +352,36 @@ void handleGameLogic() {
         default: Serial.print("未知"); break;
       }
       Serial.println(")");
-    } else if (gameState == PLAYING && canCapture) {
-      // 抓捕功能
+    } else if (isBeingCaptured && canDefend) {
+      // 正在被抓捕时，按下按钮2进行防守
+      isBeingCaptured = false;
+      canDefend = false;
+      lastDefendTime = now;
+      Serial.printf("🛡️ 防守成功！抵挡了来自 %s 的抓捕\n", capturingPlayer.c_str());
+      Serial.println("防守进入30秒冷却");
+    } else if (isBeingCaptured && !canDefend) {
+      // 防守冷却中
+      unsigned long remainingCooldown = (DEFEND_COOLDOWN - (now - lastDefendTime)) / 1000;
+      Serial.printf("防守冷却中，还剩 %lu 秒\n", remainingCooldown);
+    } else if (gameState == PLAYING && canCapture && !isBeingCaptured) {
+      // 抓捕功能 - 只抓捕敌对队伍
+      bool foundTarget = false;
       for (auto &kv : peers) {
         if (kv.second.rssi > CAPTURE_DISTANCE && kv.second.team != myTeam) {
-          Serial.printf("尝试抓捕 %s (RSSI: %d)\n", kv.first.c_str(), kv.second.rssi);
+          Serial.printf("尝试抓捕敌人 %s (队伍: %d, RSSI: %d)\n", 
+                        kv.first.c_str(), kv.second.team, kv.second.rssi);
           sendCaptureCommand(kv.first);
           canCapture = false;
           lastCaptureTime = now;
+          foundTarget = true;
           break;
+        } else if (kv.second.rssi > CAPTURE_DISTANCE && kv.second.team == myTeam) {
+          Serial.printf("跳过队友 %s (队伍: %d, RSSI: %d) - 不抓捕同队\n", 
+                        kv.first.c_str(), kv.second.team, kv.second.rssi);
         }
+      }
+      if (!foundTarget) {
+        Serial.println("附近没有可抓捕的敌人");
       }
     }
   }
@@ -260,6 +390,14 @@ void handleGameLogic() {
   if (gameState == SEARCHING && (now - gameStartTime) > SEARCH_TIME_MS) {
     gameState = PLAYING;
     Serial.printf("游戏开始！我的队伍: %d，发现 %d 个设备\n", myTeam, peers.size());
+  }
+  
+  // 游戏阶段检查胜利条件
+  if (gameState == PLAYING && checkVictory()) {
+    gameState = VICTORY;
+    victoryTime = now;
+    winningTeam = myTeam;
+    Serial.printf("🏆 胜利！队伍 %d 统一了所有玩家！\n", myTeam);
   }
 }
 
@@ -344,6 +482,15 @@ void updateMatrix() {
             displayCount++;
           }
         }
+        
+        // === 长按重置进度条（覆盖在顶部进度条上） ===
+        if (button1Pressing && button1PressStartTime > 0) {
+          unsigned long pressDuration = millis() - button1PressStartTime;
+          int longPressProgress = map(min(pressDuration, LONG_PRESS_TIME), 0, LONG_PRESS_TIME, 0, 8);
+          for (int i = 0; i < longPressProgress; i++) {
+            matrix.drawPixel(i, 7, matrix.Color(255, 165, 0)); // 橙色进度条覆盖黄色
+          }
+        }
       }
       break;
       
@@ -409,14 +556,139 @@ void updateMatrix() {
         }
       }
 
+      // === 被抓捕状态警告 ===
+      if (isBeingCaptured) {
+        unsigned long elapsed = millis() - captureStartTime;
+        unsigned long remaining = CAPTURE_WINDOW - elapsed;
+        
+        if (canDefend) {
+          // 可以防守：快速闪烁红色边框
+          static bool dangerFlash = false;
+          static unsigned long lastDangerFlash = 0;
+          if (millis() - lastDangerFlash > 100) {
+            dangerFlash = !dangerFlash;
+            lastDangerFlash = millis();
+          }
+          if (dangerFlash) {
+            // 全屏红色边框
+            for (int i = 0; i < 8; i++) {
+              matrix.drawPixel(i, 0, matrix.Color(255, 0, 0));
+              matrix.drawPixel(i, 7, matrix.Color(255, 0, 0));
+              matrix.drawPixel(0, i, matrix.Color(255, 0, 0));
+              matrix.drawPixel(7, i, matrix.Color(255, 0, 0));
+            }
+          }
+        } else {
+          // 防守冷却中：暗红色静态边框（不闪烁）
+          for (int i = 0; i < 8; i++) {
+            matrix.drawPixel(i, 0, matrix.Color(100, 0, 0)); // 暗红色
+            matrix.drawPixel(i, 7, matrix.Color(100, 0, 0));
+            matrix.drawPixel(0, i, matrix.Color(100, 0, 0));
+            matrix.drawPixel(7, i, matrix.Color(100, 0, 0));
+          }
+        }
+        
+        // 倒计时进度条（顶部，从满到空）
+        int timeProgress = map(remaining, 0, CAPTURE_WINDOW, 0, 8);
+        for (int i = 0; i < timeProgress; i++) {
+          matrix.drawPixel(i, 7, matrix.Color(255, 100, 0)); // 橙红色
+        }
+      }
+
       // === 冷却时间条（保留） ===
-      if (!canCapture) {
+      if (!canCapture && !isBeingCaptured) {
         unsigned long elapsed = millis() - lastCaptureTime;
-        int progress = map(elapsed, 0, COOLDOWN_TIME_MS, 0, 8);
+        int progress = map(elapsed, 0, COOLDOWN_TIME_MS, 0, 5);
         for (int i = 0; i < progress; i++) matrix.drawPixel(i, 0, matrix.Color(255, 0, 0));
+      }
+      
+      // === 防守冷却显示 ===
+      if (!canDefend && !isBeingCaptured) {
+        unsigned long elapsed = millis() - lastDefendTime;
+        int progress = map(elapsed, 0, DEFEND_COOLDOWN, 0, 8);
+        for (int i = 0; i < progress; i++) matrix.drawPixel(i, 0, matrix.Color(0, 0, 255)); // 蓝色防守冷却
+      }
+      
+      // === 长按重置进度条（显示在顶部） ===
+      if (button1Pressing && button1PressStartTime > 0) {
+        unsigned long pressDuration = millis() - button1PressStartTime;
+        int longPressProgress = map(min(pressDuration, LONG_PRESS_TIME), 0, LONG_PRESS_TIME, 0, 8);
+        for (int i = 0; i < longPressProgress; i++) {
+          matrix.drawPixel(i, 7, matrix.Color(255, 165, 0)); // 橙色进度条
+        }
       }
     }
     break;
+    
+    case VICTORY:
+      // 胜利状态：显示胜利动画
+      {
+        unsigned long elapsed = millis() - victoryTime;
+        uint16_t victoryColor = colorForTeam(winningTeam);
+        
+        // 动画阶段1：全屏闪烁 (0-3秒)
+        if (elapsed < 3000) {
+          static bool flash = false;
+          static unsigned long lastFlash = 0;
+          if (millis() - lastFlash > 200) {
+            flash = !flash;
+            lastFlash = millis();
+          }
+          if (flash) {
+            matrix.fillScreen(victoryColor);
+          }
+        }
+        // 动画阶段2：旋转边框 (3-6秒)
+        else if (elapsed < 6000) {
+          int phase = ((millis() / 100) % 28); // 28步完成一圈
+          // 画边框
+          for (int i = 0; i < 8; i++) {
+            matrix.drawPixel(i, 0, matrix.Color(50, 50, 50)); // 底部
+            matrix.drawPixel(i, 7, matrix.Color(50, 50, 50)); // 顶部
+            matrix.drawPixel(0, i, matrix.Color(50, 50, 50)); // 左边
+            matrix.drawPixel(7, i, matrix.Color(50, 50, 50)); // 右边
+          }
+          // 旋转的亮点
+          if (phase < 7) { // 顶部从左到右
+            matrix.drawPixel(phase, 7, victoryColor);
+          } else if (phase < 14) { // 右边从上到下
+            matrix.drawPixel(7, 7 - (phase - 7), victoryColor);
+          } else if (phase < 21) { // 底部从右到左
+            matrix.drawPixel(7 - (phase - 14), 0, victoryColor);
+          } else { // 左边从下到上
+            matrix.drawPixel(0, (phase - 21), victoryColor);
+          }
+          // 中心显示队伍颜色
+          matrix.fillRect(3, 3, 2, 2, victoryColor);
+        }
+        // 动画阶段3：烟花效果 (6秒后)
+        else {
+          static unsigned long lastFirework = 0;
+          if (millis() - lastFirework > 500) {
+            lastFirework = millis();
+            // 随机烟花位置
+            int x = random(1, 7);
+            int y = random(1, 7);
+            matrix.drawPixel(x, y, victoryColor);
+            if (x > 0) matrix.drawPixel(x-1, y, victoryColor);
+            if (x < 7) matrix.drawPixel(x+1, y, victoryColor);
+            if (y > 0) matrix.drawPixel(x, y-1, victoryColor);
+            if (y < 7) matrix.drawPixel(x, y+1, victoryColor);
+          }
+          // 中心大字 "V"
+          matrix.fillRect(3, 3, 2, 2, victoryColor);
+        }
+        
+        // === 长按重置进度条（在胜利状态也显示） ===
+        if (button1Pressing && button1PressStartTime > 0) {
+          unsigned long pressDuration = millis() - button1PressStartTime;
+          int longPressProgress = map(min(pressDuration, LONG_PRESS_TIME), 0, LONG_PRESS_TIME, 0, 8);
+          for (int i = 0; i < longPressProgress; i++) {
+            matrix.drawPixel(i, 0, matrix.Color(255, 165, 0)); // 橙色进度条在底部
+          }
+        }
+      }
+      break;
   }
 
   matrix.show();
@@ -433,16 +705,28 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
 
   // 处理抓捕命令
   if (p->captureCmd == 1 && gameState == PLAYING) {
-    // 收到抓捕命令，检查是否在范围内
-    if (rssiNow > CAPTURE_DISTANCE) {
-      // 被抓捕，改变队伍
-      PlayerTeam oldTeam = myTeam;
-      myTeam = p->team;
-      Serial.printf("被 %s 抓捕！队伍从 %d 变为 %d\n", macStr.c_str(), oldTeam, myTeam);
+    // 收到抓捕命令，检查是否在范围内 AND 不是同队
+    if (rssiNow > CAPTURE_DISTANCE && p->team != myTeam && !isBeingCaptured) {
+      // 进入被抓捕状态，给玩家5秒时间防守
+      isBeingCaptured = true;
+      captureStartTime = millis();
+      capturingPlayer = macStr;
+      capturingTeam = p->team;
       
-      // 强制冷却
-      canCapture = false;
-      lastCaptureTime = millis();
+      Serial.printf("⚠️ 正在被 %s 抓捕！快速按下按钮2防守！(队伍: %d)\n", 
+                    macStr.c_str(), p->team);
+      Serial.printf("剩余时间: 5秒 | 防守状态: %s\n", 
+                    canDefend ? "可用" : "冷却中");
+      
+    } else if (isBeingCaptured) {
+      // 已经在被抓捕状态中
+      Serial.printf("收到 %s 的抓捕命令，但已经在被抓捕状态中\n", macStr.c_str());
+    } else if (p->team == myTeam) {
+      // 同队队友的抓捕命令，忽略
+      Serial.printf("收到队友 %s 的抓捕命令，忽略（同队不会被抓）\n", macStr.c_str());
+    } else {
+      // 在范围外
+      Serial.printf("收到 %s 的抓捕命令，但不在范围内 (RSSI: %d)\n", macStr.c_str(), rssiNow);
     }
   }
 
@@ -550,6 +834,24 @@ void setup() {
   // 初始化按键
   pinMode(BUTTON1_PIN, INPUT_PULLUP);
   pinMode(BUTTON2_PIN, INPUT_PULLUP);
+  
+  // 读取初始按钮状态，确保 button1Pressing 正确初始化
+  delay(50); // 等待引脚稳定
+  int rawButton1 = digitalRead(BUTTON1_PIN);
+  bool initialButton1State = (rawButton1 == HIGH);  // 反转逻辑！
+  
+  Serial.printf("按钮1初始状态: digitalRead=%d, 判定为%s\n", 
+                rawButton1, 
+                initialButton1State ? "按下" : "未按下");
+  
+  button1Pressing = false; // 启动时强制设为未按下状态
+  button1PressStartTime = 0; // 清零计时器
+  
+  if (initialButton1State) {
+    Serial.println("警告: 启动时检测到按钮1被按下，请释放按钮");
+  } else {
+    Serial.println("按钮状态正常");
+  }
 
   matrix.begin();
   matrix.setBrightness(40);           // 亮度适中；可调 20~60
@@ -588,6 +890,16 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+  
+  // 调试：每2秒打印一次按钮状态
+  static unsigned long lastDebugPrint = 0;
+  if (now - lastDebugPrint > 2000) {
+    int rawBtn = digitalRead(BUTTON1_PIN);
+    Serial.printf("[MONITOR] 按钮1: digitalRead=%d, button1Pressing=%s\n", 
+                  rawBtn, 
+                  button1Pressing ? "true" : "false");
+    lastDebugPrint = now;
+  }
   
   // 处理游戏逻辑和按键
   handleGameLogic();
