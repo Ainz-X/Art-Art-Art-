@@ -102,6 +102,11 @@ uint8_t selfMac[6];
 uint32_t seqNo = 0;
 unsigned long lastPing = 0;
 
+// ====== 函数声明 ======
+float rssiToDistanceMeters(int rssi, float txPower = -59.0f, float n = 2.0f);
+int distanceToEdgeLen(float d);
+uint16_t colorForTeam(PlayerTeam team);
+void drawEdgeBar(int side, int len, uint16_t color);
 // ====== 小工具 ======
 String macToString(const uint8_t mac[6]) {
   char buf[18];
@@ -484,7 +489,7 @@ void sendCaptureCommand(const String& targetMac) {
 // === 距离估算与边绘制（新增） ===
 
 // 经验模型：1米参考发射功率 txPower≈-59dBm，室内路径损耗指数 n≈2.0
-float rssiToDistanceMeters(int rssi, float txPower = -59.0f, float n = 2.0f) {
+float rssiToDistanceMeters(int rssi, float txPower, float n) {
   rssi = constrain(rssi, -100, -30);
   float ratio = (txPower - (float)rssi) / (10.0f * n);
   // 避免数值过大：限定 0.1m ~ 20m
