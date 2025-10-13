@@ -47,6 +47,7 @@ static const uint32_t SEARCH_TIME_MS   = 8000; // 搜索时间8秒
 
 // ====== 游戏状态 ======
 enum GameState {
+  TEAM_SELECT,  // 队伍选择
   WAITING,      // 等待开始
   SEARCHING,    // 搜索设备中
   PLAYING       // 游戏进行中
@@ -66,7 +67,7 @@ enum PlayerTeam {
 // ====== 手动队伍选择 ======
 PlayerTeam selectedTeam = TEAM_RED;  // 默认红队，可通过按键选择
 
-GameState gameState = WAITING;
+GameState gameState = TEAM_SELECT;
 PlayerTeam myTeam = TEAM_NEUTRAL;
 unsigned long gameStartTime = 0;
 unsigned long lastCaptureTime = 0;
@@ -78,13 +79,6 @@ bool lastButton2 = false;
 unsigned long lastButton1Press = 0;
 unsigned long lastButton2Press = 0;
 const unsigned long DEBOUNCE_TIME = 50;
-const unsigned long LONG_PRESS_TIME = 1000; // 长按时间1秒
-
-// 长按状态检测
-bool button1LongPressed = false;
-bool button2LongPressed = false;
-unsigned long button1PressStart = 0;
-unsigned long button2PressStart = 0;
 
 struct Packet { 
   char magic[4]; 
@@ -156,25 +150,6 @@ bool readButton(int pin, bool &lastState, unsigned long &lastPress) {
   }
   return false;
 }
-
-// 长按检测
-bool checkLongPress(int pin, bool &longPressed, unsigned long &pressStart) {
-  bool current = digitalRead(pin) == LOW;
-  unsigned long now = millis();
-  
-  if (current && !longPressed) {
-    if (pressStart == 0) {
-      pressStart = now;
-    } else if ((now - pressStart) >= LONG_PRESS_TIME) {
-      longPressed = true;
-      return true;
-    }
-  } else if (!current) {
-    pressStart = 0;
-    longPressed = false;
-  }
-  return false;
-}
 void prunePeers() {
   unsigned long now = millis();
   std::vector<String> dead;
@@ -200,13 +175,27 @@ void handleGameLogic() {
     lastSearchUpdate = now;
   }
   
-  // 按键1长按处理 (开始/结束游戏)
-  if (checkLongPress(BUTTON1_PIN, button1LongPressed, button1PressStart)) {
+  // 按键处理
+  if (readButton(BUTTON1_PIN, lastButton1, lastButton1Press)) {
     switch(gameState) {
+      case TEAM_SELECT:
+        // 确认选择的队伍，进入等待状态
+        gameState = WAITING;
+        Serial.printf("已选择队伍: %d (", selectedTeam);
+        switch(selectedTeam) {
+          case TEAM_RED: Serial.print("红色"); break;
+          case TEAM_GREEN: Serial.print("绿色"); break;
+          case TEAM_BLUE: Serial.print("蓝色"); break;
+          case TEAM_YELLOW: Serial.print("黄色"); break;
+          default: Serial.print("未知"); break;
+        }
+        Serial.println(") - 按按键1开始游戏");
+        break;
+        
       case WAITING:
         gameState = SEARCHING;
         gameStartTime = now;
-        myTeam = selectedTeam; // 使用当前选择的队伍
+        myTeam = assignTeamByMac(selfMac);
         Serial.printf("开始搜索设备... 我的队伍: %d (颜色: ", myTeam);
         switch(myTeam) {
           case TEAM_RED: Serial.print("红色"); break;
@@ -220,17 +209,17 @@ void handleGameLogic() {
         
       case SEARCHING:
       case PLAYING:
-        gameState = WAITING;
-        myTeam = selectedTeam; // 重置为选择的队伍
+        gameState = TEAM_SELECT;
+        myTeam = TEAM_NEUTRAL;
         peers.clear();
-        Serial.println("游戏结束 - 返回等待状态");
+        Serial.println("游戏结束 - 重新选择队伍");
         break;
     }
   }
   
   // 按键2处理
   if (readButton(BUTTON2_PIN, lastButton2, lastButton2Press)) {
-    if (gameState == WAITING) {
+    if (gameState == TEAM_SELECT) {
       // 切换队伍选择
       switch(selectedTeam) {
         case TEAM_RED: selectedTeam = TEAM_GREEN; break;
@@ -275,13 +264,31 @@ void updateMatrix() {
   matrix.fillScreen(0);
   
   switch(gameState) {
-    case WAITING:
-      // 等待状态：显示当前选择的队伍颜色 (4x4中心区域)
+    case TEAM_SELECT:
+      // 队伍选择状态：显示当前选择的队伍颜色
       {
-        // 显示选择的队伍颜色 (4x4中心区域)
-        matrix.fillRect(2, 2, 4, 4, colorForTeam(selectedTeam));
+        // 显示选择的队伍颜色 (中心区域)
+        matrix.fillRect(3, 3, 2, 2, colorForTeam(selectedTeam));
         
         // 显示选择提示 (四角闪烁)
+        static bool blink = false;
+        static unsigned long lastBlink = 0;
+        if (millis() - lastBlink > 300) {
+          blink = !blink;
+          lastBlink = millis();
+        }
+        if (blink) {
+          matrix.drawPixel(1, 1, matrix.Color(255, 255, 255)); // 左下
+          matrix.drawPixel(6, 1, matrix.Color(255, 255, 255)); // 右下
+          matrix.drawPixel(1, 6, matrix.Color(255, 255, 255)); // 左上
+          matrix.drawPixel(6, 6, matrix.Color(255, 255, 255)); // 右上
+        }
+      }
+      break;
+      
+    case WAITING:
+      // 等待状态：闪烁蓝色中心
+      {
         static bool blink = false;
         static unsigned long lastBlink = 0;
         if (millis() - lastBlink > 500) {
@@ -289,10 +296,7 @@ void updateMatrix() {
           lastBlink = millis();
         }
         if (blink) {
-          matrix.drawPixel(0, 0, matrix.Color(255, 255, 255)); // 左下
-          matrix.drawPixel(7, 0, matrix.Color(255, 255, 255)); // 右下
-          matrix.drawPixel(0, 7, matrix.Color(255, 255, 255)); // 左上
-          matrix.drawPixel(7, 7, matrix.Color(255, 255, 255)); // 右上
+          matrix.fillRect(3, 3, 2, 2, matrix.Color(0, 0, 100));
         }
       }
       break;
@@ -308,8 +312,8 @@ void updateMatrix() {
           matrix.drawPixel(i, 7, matrix.Color(100, 100, 0));
         }
         
-        // 显示我的颜色 (4x4中心)
-        matrix.fillRect(2, 2, 4, 4, colorForTeam(myTeam));
+        // 显示我的颜色 (中心)
+        matrix.fillRect(3, 3, 2, 2, colorForTeam(myTeam));
         
         // 显示发现的设备数量 (底部用点表示)
         int deviceCount = peers.size();
@@ -339,60 +343,75 @@ void updateMatrix() {
       break;
       
     case PLAYING:
-      // 游戏状态：显示自己和可抓捕提示
-      {
-        // 显示我的状态 (4x4中心区域)
-        uint16_t myColor = colorForTeam(myTeam);
-        if (!canCapture) {
-          // 冷却中，降低亮度
-          myColor = matrix.Color(
-            ((myColor >> 11) & 0x1F) >> 2,  // R
-            ((myColor >> 5) & 0x3F) >> 2,   // G
-            (myColor & 0x1F) >> 2           // B
-          );
+    {
+      // === 中心显示：保持你原有逻辑 ===
+      uint16_t myColor = colorForTeam(myTeam);
+      if (!canCapture) {
+        // 冷却时稍微暗一点
+        myColor = matrix.Color(
+          ((myColor >> 11) & 0x1F) >> 2,
+          ((myColor >> 5)  & 0x3F) >> 2,
+          ( myColor        & 0x1F) >> 2
+        );
+      }
+      matrix.fillRect(3, 3, 2, 2, myColor);
+
+      // === 选出最多 4 个“非本队”邻居，按 RSSI 近→远 ===
+      std::vector<std::pair<String, PeerInfo>> enemies;
+      enemies.reserve(peers.size());
+      for (auto &kv : peers) {
+        if (kv.second.team != myTeam) enemies.push_back(kv);
+      }
+      std::sort(enemies.begin(), enemies.end(),
+                [](const auto &a, const auto &b){ return a.second.rssi > b.second.rssi; });
+
+      // === 将最近的4个分配到 TOP/RIGHT/BOTTOM/LEFT 四个边 ===
+      const uint8_t SIDES[4] = {0,1,2,3};
+      int shown = 0;
+      for (size_t i = 0; i < enemies.size() && shown < 4; ++i) {
+        const auto &mac  = enemies[i].first;
+        const auto &peer = enemies[i].second;
+        // RSSI→距离估算
+        float d = rssiToDistanceMeters(peer.rssi);
+        int   L = distanceToEdgeLen(d);
+        uint16_t c = colorForTeam(peer.team);
+        // 把第 shown 个敌人放到第 shown 条边
+        drawEdgeBar(SIDES[shown], L, c);
+        // 调试输出
+        Serial.printf("[PLAYING] enemy %s team=%d RSSI=%d -> %.2fm, len=%d, side=%d\n",
+                      mac.c_str(), (int)peer.team, peer.rssi, d, L, (int)SIDES[shown]);
+        shown++;
+      }
+
+      // === 可抓捕目标闪烁边框（保持你的提示逻辑） ===
+      bool hasTarget = false;
+      for (auto &kv : peers) {
+        if (kv.second.rssi > CAPTURE_DISTANCE && kv.second.team != myTeam) {
+          hasTarget = true; break;
         }
-        matrix.fillRect(2, 2, 4, 4, myColor);
-        
-        // 检查是否有可抓捕的目标并显示闪烁提示
-        bool hasTarget = false;
-        for (auto &kv : peers) {
-          if (kv.second.rssi > CAPTURE_DISTANCE && kv.second.team != myTeam) {
-            hasTarget = true;
-            break;
-          }
-        }
-        
-        // 如果有可抓捕目标，显示边框闪烁
-        if (hasTarget && canCapture) {
-          static bool captureFlash = false;
-          static unsigned long lastFlash = 0;
-          if (millis() - lastFlash > 200) {
-            captureFlash = !captureFlash;
-            lastFlash = millis();
-          }
-          if (captureFlash) {
-            // 在4x4中心区域周围显示白色边框
-            for (int i = 1; i <= 6; i++) {
-              matrix.drawPixel(i, 1, matrix.Color(255, 255, 255)); // 下边框
-              matrix.drawPixel(i, 6, matrix.Color(255, 255, 255)); // 上边框
-            }
-            for (int i = 1; i <= 6; i++) {
-              matrix.drawPixel(1, i, matrix.Color(255, 255, 255)); // 左边框
-              matrix.drawPixel(6, i, matrix.Color(255, 255, 255)); // 右边框
-            }
-          }
-        }
-        
-        // 冷却时间指示器
-        if (!canCapture) {
-          unsigned long elapsed = millis() - lastCaptureTime;
-          int progress = map(elapsed, 0, COOLDOWN_TIME_MS, 0, 8);
-          for (int i = 0; i < progress; i++) {
-            matrix.drawPixel(i, 0, matrix.Color(255, 0, 0)); // 红色进度条
+      }
+      if (hasTarget && canCapture) {
+        static bool captureFlash = false;
+        static unsigned long lastFlash = 0;
+        if (millis() - lastFlash > 200) { captureFlash = !captureFlash; lastFlash = millis(); }
+        if (captureFlash) {
+          for (int i = 2; i <= 5; i++) {
+            matrix.drawPixel(i, 2, matrix.Color(255, 255, 255));
+            matrix.drawPixel(i, 5, matrix.Color(255, 255, 255));
+            matrix.drawPixel(2, i, matrix.Color(255, 255, 255));
+            matrix.drawPixel(5, i, matrix.Color(255, 255, 255));
           }
         }
       }
-      break;
+
+      // === 冷却时间条（保留） ===
+      if (!canCapture) {
+        unsigned long elapsed = millis() - lastCaptureTime;
+        int progress = map(elapsed, 0, COOLDOWN_TIME_MS, 0, 8);
+        for (int i = 0; i < progress; i++) matrix.drawPixel(i, 0, matrix.Color(255, 0, 0));
+      }
+    }
+    break;
   }
 
   matrix.show();
@@ -462,6 +481,43 @@ void sendCaptureCommand(const String& targetMac) {
   pkt.captureCmd = 1; // 抓捕命令
   esp_now_send(BCAST, reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
 }
+// === 距离估算与边绘制（新增） ===
+
+// 经验模型：1米参考发射功率 txPower≈-59dBm，室内路径损耗指数 n≈2.0
+float rssiToDistanceMeters(int rssi, float txPower = -59.0f, float n = 2.0f) {
+  rssi = constrain(rssi, -100, -30);
+  float ratio = (txPower - (float)rssi) / (10.0f * n);
+  // 避免数值过大：限定 0.1m ~ 20m
+  float d = powf(10.0f, ratio);
+  return constrain(d, 0.1f, 20.0f);
+}
+
+// 距离(米)映射到边条长度(1~7，越近越长)
+int distanceToEdgeLen(float meters) {
+  // 0.3m → 7格； 8m → 1格（可按实际场地调）
+  float m = constrain(meters, 0.3f, 8.0f);
+  int len = map((int)(m * 100), (int)(0.3f * 100), (int)(8.0f * 100), 7, 1);
+  return constrain(len, 1, 7);
+}
+
+// 在四条边绘制长度为 len 的条（方向：0=TOP,1=RIGHT,2=BOTTOM,3=LEFT）
+void drawEdgeBar(uint8_t side, int len, uint16_t color) {
+  len = constrain(len, 1, 7);
+  switch (side) {
+    case 0: { // TOP (y=7，从x=0向右)
+      for (int x = 0; x < len; ++x) matrix.drawPixel(x, 7, color);
+    } break;
+    case 1: { // RIGHT (x=7，从y=7向下)
+      for (int y = 7; y > 7 - len; --y) matrix.drawPixel(7, y, color);
+    } break;
+    case 2: { // BOTTOM (y=0，从x=7向左)
+      for (int x = 7; x > 7 - len; --x) matrix.drawPixel(x, 0, color);
+    } break;
+    case 3: { // LEFT (x=0，从y=0向上)
+      for (int y = 0; y < len; ++y) matrix.drawPixel(0, y, color);
+    } break;
+  }
+}
 
 // ====== 初始化 ======
 void initWiFiEspNow() {
@@ -491,7 +547,7 @@ void setup() {
   pinMode(BUTTON2_PIN, INPUT_PULLUP);
 
   matrix.begin();
-  matrix.setBrightness(10);           // 降低亮度
+  matrix.setBrightness(40);           // 亮度适中；可调 20~60
   matrix.fillScreen(0);
   
   // 开机自检：显示启动动画
@@ -510,9 +566,9 @@ void setup() {
   
   Serial.println("ESP32-S3 抓捕游戏已启动");
   Serial.printf("MAC地址: %s\n", macToString(selfMac).c_str());
-  Serial.println("=== 等待状态 ===");
+  Serial.println("=== 队伍选择模式 ===");
   Serial.println("按键2: 切换队伍颜色 (红->绿->蓝->黄->红...)");
-  Serial.println("按键1长按1秒: 开始游戏");
+  Serial.println("按键1: 确认选择的队伍");
   Serial.printf("当前选择: %d (", selectedTeam);
   switch(selectedTeam) {
     case TEAM_RED: Serial.print("红色"); break;
@@ -523,6 +579,7 @@ void setup() {
   }
   Serial.println(")");
 }
+
 
 void loop() {
   unsigned long now = millis();
