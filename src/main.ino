@@ -299,15 +299,24 @@ void handleGameLogic() {
       }
       Serial.println(")");
     } else if (gameState == PLAYING && canCapture) {
-      // 抓捕功能
+      // 抓捕功能 - 只抓捕敌对队伍
+      bool foundTarget = false;
       for (auto &kv : peers) {
         if (kv.second.rssi > CAPTURE_DISTANCE && kv.second.team != myTeam) {
-          Serial.printf("尝试抓捕 %s (RSSI: %d)\n", kv.first.c_str(), kv.second.rssi);
+          Serial.printf("尝试抓捕敌人 %s (队伍: %d, RSSI: %d)\n", 
+                        kv.first.c_str(), kv.second.team, kv.second.rssi);
           sendCaptureCommand(kv.first);
           canCapture = false;
           lastCaptureTime = now;
+          foundTarget = true;
           break;
+        } else if (kv.second.rssi > CAPTURE_DISTANCE && kv.second.team == myTeam) {
+          Serial.printf("跳过队友 %s (队伍: %d, RSSI: %d) - 不抓捕同队\n", 
+                        kv.first.c_str(), kv.second.team, kv.second.rssi);
         }
+      }
+      if (!foundTarget) {
+        Serial.println("附近没有可抓捕的敌人");
       }
     }
   }
@@ -507,16 +516,22 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
 
   // 处理抓捕命令
   if (p->captureCmd == 1 && gameState == PLAYING) {
-    // 收到抓捕命令，检查是否在范围内
-    if (rssiNow > CAPTURE_DISTANCE) {
-      // 被抓捕，改变队伍
+    // 收到抓捕命令，检查是否在范围内 AND 不是同队
+    if (rssiNow > CAPTURE_DISTANCE && p->team != myTeam) {
+      // 被敌对队伍抓捕，改变队伍
       PlayerTeam oldTeam = myTeam;
       myTeam = p->team;
-      Serial.printf("被 %s 抓捕！队伍从 %d 变为 %d\n", macStr.c_str(), oldTeam, myTeam);
+      Serial.printf("被敌队 %s 抓捕！队伍从 %d 变为 %d\n", macStr.c_str(), oldTeam, myTeam);
       
       // 强制冷却
       canCapture = false;
       lastCaptureTime = millis();
+    } else if (p->team == myTeam) {
+      // 同队队友的抓捕命令，忽略
+      Serial.printf("收到队友 %s 的抓捕命令，忽略（同队不会被抓）\n", macStr.c_str());
+    } else {
+      // 在范围外
+      Serial.printf("收到 %s 的抓捕命令，但不在范围内 (RSSI: %d)\n", macStr.c_str(), rssiNow);
     }
   }
 
