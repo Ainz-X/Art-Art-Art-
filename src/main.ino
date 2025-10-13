@@ -50,7 +50,8 @@ enum GameState {
   TEAM_SELECT,  // 队伍选择
   WAITING,      // 等待开始
   SEARCHING,    // 搜索设备中
-  PLAYING       // 游戏进行中
+  PLAYING,      // 游戏进行中
+  VICTORY       // 胜利状态
 };
 
 enum PlayerTeam {
@@ -72,6 +73,10 @@ PlayerTeam myTeam = TEAM_NEUTRAL;
 unsigned long gameStartTime = 0;
 unsigned long lastCaptureTime = 0;
 bool canCapture = true;
+
+// ====== 胜利状态 ======
+unsigned long victoryTime = 0;
+PlayerTeam winningTeam = TEAM_NEUTRAL;
 
 // ====== 按键状态 ======
 bool lastButton1 = false;
@@ -112,6 +117,7 @@ float rssiToDistanceMeters(int rssi, float txPower = -59.0f, float n = 2.0f);
 int distanceToEdgeLen(float d);
 uint16_t colorForTeam(PlayerTeam team);
 void drawEdgeBar(int side, int len, uint16_t color);
+bool checkVictory();
 // ====== 小工具 ======
 String macToString(const uint8_t mac[6]) {
   char buf[18];
@@ -167,6 +173,24 @@ void prunePeers() {
   for (auto &k : dead) peers.erase(k);
 }
 
+// 检查是否所有玩家都是同一队伍（胜利条件）
+bool checkVictory() {
+  // 至少需要2个玩家（自己+至少1个其他玩家）
+  if (peers.size() < 1) {
+    return false;
+  }
+  
+  // 检查所有在线玩家是否都是同一队伍
+  for (auto &kv : peers) {
+    if (kv.second.team != myTeam) {
+      return false; // 发现不同队伍的玩家
+    }
+  }
+  
+  // 所有玩家都是同一队伍
+  return true;
+}
+
 // ====== 游戏逻辑 ======
 void handleGameLogic() {
   unsigned long now = millis();
@@ -212,8 +236,8 @@ void handleGameLogic() {
     Serial.printf("[DEBUG] 按钮释放，持续时长: %.2f秒\n", pressDuration / 1000.0f);
     
     // 根据按压时长和游戏状态处理
-    if (gameState == SEARCHING || gameState == PLAYING) {
-      // 在游戏中需要长按3秒才能重置
+    if (gameState == SEARCHING || gameState == PLAYING || gameState == VICTORY) {
+      // 在游戏中或胜利状态需要长按3秒才能重置
       if (pressDuration >= LONG_PRESS_TIME) {
         gameState = TEAM_SELECT;
         myTeam = TEAM_NEUTRAL;
@@ -260,7 +284,7 @@ void handleGameLogic() {
   }
   
   // 长按过程中显示进度提示
-  if (button1Pressing && (gameState == SEARCHING || gameState == PLAYING)) {
+  if (button1Pressing && (gameState == SEARCHING || gameState == PLAYING || gameState == VICTORY)) {
     unsigned long pressDuration = now - button1PressStartTime;
     static unsigned long lastProgressPrint = 0;
     if (pressDuration >= LONG_PRESS_TIME) {
@@ -325,6 +349,14 @@ void handleGameLogic() {
   if (gameState == SEARCHING && (now - gameStartTime) > SEARCH_TIME_MS) {
     gameState = PLAYING;
     Serial.printf("游戏开始！我的队伍: %d，发现 %d 个设备\n", myTeam, peers.size());
+  }
+  
+  // 游戏阶段检查胜利条件
+  if (gameState == PLAYING && checkVictory()) {
+    gameState = VICTORY;
+    victoryTime = now;
+    winningTeam = myTeam;
+    Serial.printf("🏆 胜利！队伍 %d 统一了所有玩家！\n", myTeam);
   }
 }
 
@@ -486,7 +518,7 @@ void updateMatrix() {
       // === 冷却时间条（保留） ===
       if (!canCapture) {
         unsigned long elapsed = millis() - lastCaptureTime;
-        int progress = map(elapsed, 0, COOLDOWN_TIME_MS, 0, 8);
+        int progress = map(elapsed, 0, COOLDOWN_TIME_MS, 0, 5);
         for (int i = 0; i < progress; i++) matrix.drawPixel(i, 0, matrix.Color(255, 0, 0));
       }
       
@@ -500,6 +532,76 @@ void updateMatrix() {
       }
     }
     break;
+    
+    case VICTORY:
+      // 胜利状态：显示胜利动画
+      {
+        unsigned long elapsed = millis() - victoryTime;
+        uint16_t victoryColor = colorForTeam(winningTeam);
+        
+        // 动画阶段1：全屏闪烁 (0-3秒)
+        if (elapsed < 3000) {
+          static bool flash = false;
+          static unsigned long lastFlash = 0;
+          if (millis() - lastFlash > 200) {
+            flash = !flash;
+            lastFlash = millis();
+          }
+          if (flash) {
+            matrix.fillScreen(victoryColor);
+          }
+        }
+        // 动画阶段2：旋转边框 (3-6秒)
+        else if (elapsed < 6000) {
+          int phase = ((millis() / 100) % 28); // 28步完成一圈
+          // 画边框
+          for (int i = 0; i < 8; i++) {
+            matrix.drawPixel(i, 0, matrix.Color(50, 50, 50)); // 底部
+            matrix.drawPixel(i, 7, matrix.Color(50, 50, 50)); // 顶部
+            matrix.drawPixel(0, i, matrix.Color(50, 50, 50)); // 左边
+            matrix.drawPixel(7, i, matrix.Color(50, 50, 50)); // 右边
+          }
+          // 旋转的亮点
+          if (phase < 7) { // 顶部从左到右
+            matrix.drawPixel(phase, 7, victoryColor);
+          } else if (phase < 14) { // 右边从上到下
+            matrix.drawPixel(7, 7 - (phase - 7), victoryColor);
+          } else if (phase < 21) { // 底部从右到左
+            matrix.drawPixel(7 - (phase - 14), 0, victoryColor);
+          } else { // 左边从下到上
+            matrix.drawPixel(0, (phase - 21), victoryColor);
+          }
+          // 中心显示队伍颜色
+          matrix.fillRect(3, 3, 2, 2, victoryColor);
+        }
+        // 动画阶段3：烟花效果 (6秒后)
+        else {
+          static unsigned long lastFirework = 0;
+          if (millis() - lastFirework > 500) {
+            lastFirework = millis();
+            // 随机烟花位置
+            int x = random(1, 7);
+            int y = random(1, 7);
+            matrix.drawPixel(x, y, victoryColor);
+            if (x > 0) matrix.drawPixel(x-1, y, victoryColor);
+            if (x < 7) matrix.drawPixel(x+1, y, victoryColor);
+            if (y > 0) matrix.drawPixel(x, y-1, victoryColor);
+            if (y < 7) matrix.drawPixel(x, y+1, victoryColor);
+          }
+          // 中心大字 "V"
+          matrix.fillRect(3, 3, 2, 2, victoryColor);
+        }
+        
+        // === 长按重置进度条（在胜利状态也显示） ===
+        if (button1Pressing && button1PressStartTime > 0) {
+          unsigned long pressDuration = millis() - button1PressStartTime;
+          int longPressProgress = map(min(pressDuration, LONG_PRESS_TIME), 0, LONG_PRESS_TIME, 0, 8);
+          for (int i = 0; i < longPressProgress; i++) {
+            matrix.drawPixel(i, 0, matrix.Color(255, 165, 0)); // 橙色进度条在底部
+          }
+        }
+      }
+      break;
   }
 
   matrix.show();
