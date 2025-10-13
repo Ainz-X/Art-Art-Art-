@@ -74,6 +74,17 @@ unsigned long gameStartTime = 0;
 unsigned long lastCaptureTime = 0;
 bool canCapture = true;
 
+// ====== 防守机制 ======
+bool isBeingCaptured = false;         // 是否正在被抓捕
+unsigned long captureStartTime = 0;   // 被抓捕开始时间
+const unsigned long CAPTURE_WINDOW = 3000;  // 53秒防守窗口
+String capturingPlayer = "";          // 正在抓捕我的玩家MAC
+PlayerTeam capturingTeam = TEAM_NEUTRAL;  // 抓捕者的队伍
+
+bool canDefend = true;                // 是否可以防守
+unsigned long lastDefendTime = 0;     // 上次防守时间
+const unsigned long DEFEND_COOLDOWN = 30000; // 防守冷却30秒
+
 // ====== 胜利状态 ======
 unsigned long victoryTime = 0;
 PlayerTeam winningTeam = TEAM_NEUTRAL;
@@ -200,6 +211,25 @@ void handleGameLogic() {
     canCapture = true;
   }
   
+  // 检查防守冷却时间
+  if (!canDefend && (now - lastDefendTime) > DEFEND_COOLDOWN) {
+    canDefend = true;
+    Serial.println("防守冷却结束，可以再次防守");
+  }
+  
+  // 检查被抓捕状态超时
+  if (isBeingCaptured && (now - captureStartTime) > CAPTURE_WINDOW) {
+    // 5秒内没有防守，被成功抓捕
+    PlayerTeam oldTeam = myTeam;
+    myTeam = capturingTeam;
+    isBeingCaptured = false;
+    Serial.printf("❌ 未能防守！队伍从 %d 变为 %d\n", oldTeam, myTeam);
+    
+    // 强制冷却
+    canCapture = false;
+    lastCaptureTime = now;
+  }
+  
   // 搜索阶段显示进度 (每2秒更新一次)
   static unsigned long lastSearchUpdate = 0;
   if (gameState == SEARCHING && (now - lastSearchUpdate) > 2000) {
@@ -322,7 +352,18 @@ void handleGameLogic() {
         default: Serial.print("未知"); break;
       }
       Serial.println(")");
-    } else if (gameState == PLAYING && canCapture) {
+    } else if (isBeingCaptured && canDefend) {
+      // 正在被抓捕时，按下按钮2进行防守
+      isBeingCaptured = false;
+      canDefend = false;
+      lastDefendTime = now;
+      Serial.printf("🛡️ 防守成功！抵挡了来自 %s 的抓捕\n", capturingPlayer.c_str());
+      Serial.println("防守进入30秒冷却");
+    } else if (isBeingCaptured && !canDefend) {
+      // 防守冷却中
+      unsigned long remainingCooldown = (DEFEND_COOLDOWN - (now - lastDefendTime)) / 1000;
+      Serial.printf("防守冷却中，还剩 %lu 秒\n", remainingCooldown);
+    } else if (gameState == PLAYING && canCapture && !isBeingCaptured) {
       // 抓捕功能 - 只抓捕敌对队伍
       bool foundTarget = false;
       for (auto &kv : peers) {
@@ -515,11 +556,57 @@ void updateMatrix() {
         }
       }
 
+      // === 被抓捕状态警告 ===
+      if (isBeingCaptured) {
+        unsigned long elapsed = millis() - captureStartTime;
+        unsigned long remaining = CAPTURE_WINDOW - elapsed;
+        
+        if (canDefend) {
+          // 可以防守：快速闪烁红色边框
+          static bool dangerFlash = false;
+          static unsigned long lastDangerFlash = 0;
+          if (millis() - lastDangerFlash > 100) {
+            dangerFlash = !dangerFlash;
+            lastDangerFlash = millis();
+          }
+          if (dangerFlash) {
+            // 全屏红色边框
+            for (int i = 0; i < 8; i++) {
+              matrix.drawPixel(i, 0, matrix.Color(255, 0, 0));
+              matrix.drawPixel(i, 7, matrix.Color(255, 0, 0));
+              matrix.drawPixel(0, i, matrix.Color(255, 0, 0));
+              matrix.drawPixel(7, i, matrix.Color(255, 0, 0));
+            }
+          }
+        } else {
+          // 防守冷却中：暗红色静态边框（不闪烁）
+          for (int i = 0; i < 8; i++) {
+            matrix.drawPixel(i, 0, matrix.Color(100, 0, 0)); // 暗红色
+            matrix.drawPixel(i, 7, matrix.Color(100, 0, 0));
+            matrix.drawPixel(0, i, matrix.Color(100, 0, 0));
+            matrix.drawPixel(7, i, matrix.Color(100, 0, 0));
+          }
+        }
+        
+        // 倒计时进度条（顶部，从满到空）
+        int timeProgress = map(remaining, 0, CAPTURE_WINDOW, 0, 8);
+        for (int i = 0; i < timeProgress; i++) {
+          matrix.drawPixel(i, 7, matrix.Color(255, 100, 0)); // 橙红色
+        }
+      }
+
       // === 冷却时间条（保留） ===
-      if (!canCapture) {
+      if (!canCapture && !isBeingCaptured) {
         unsigned long elapsed = millis() - lastCaptureTime;
         int progress = map(elapsed, 0, COOLDOWN_TIME_MS, 0, 5);
         for (int i = 0; i < progress; i++) matrix.drawPixel(i, 0, matrix.Color(255, 0, 0));
+      }
+      
+      // === 防守冷却显示 ===
+      if (!canDefend && !isBeingCaptured) {
+        unsigned long elapsed = millis() - lastDefendTime;
+        int progress = map(elapsed, 0, DEFEND_COOLDOWN, 0, 8);
+        for (int i = 0; i < progress; i++) matrix.drawPixel(i, 0, matrix.Color(0, 0, 255)); // 蓝色防守冷却
       }
       
       // === 长按重置进度条（显示在顶部） ===
@@ -619,15 +706,21 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   // 处理抓捕命令
   if (p->captureCmd == 1 && gameState == PLAYING) {
     // 收到抓捕命令，检查是否在范围内 AND 不是同队
-    if (rssiNow > CAPTURE_DISTANCE && p->team != myTeam) {
-      // 被敌对队伍抓捕，改变队伍
-      PlayerTeam oldTeam = myTeam;
-      myTeam = p->team;
-      Serial.printf("被敌队 %s 抓捕！队伍从 %d 变为 %d\n", macStr.c_str(), oldTeam, myTeam);
+    if (rssiNow > CAPTURE_DISTANCE && p->team != myTeam && !isBeingCaptured) {
+      // 进入被抓捕状态，给玩家5秒时间防守
+      isBeingCaptured = true;
+      captureStartTime = millis();
+      capturingPlayer = macStr;
+      capturingTeam = p->team;
       
-      // 强制冷却
-      canCapture = false;
-      lastCaptureTime = millis();
+      Serial.printf("⚠️ 正在被 %s 抓捕！快速按下按钮2防守！(队伍: %d)\n", 
+                    macStr.c_str(), p->team);
+      Serial.printf("剩余时间: 5秒 | 防守状态: %s\n", 
+                    canDefend ? "可用" : "冷却中");
+      
+    } else if (isBeingCaptured) {
+      // 已经在被抓捕状态中
+      Serial.printf("收到 %s 的抓捕命令，但已经在被抓捕状态中\n", macStr.c_str());
     } else if (p->team == myTeam) {
       // 同队队友的抓捕命令，忽略
       Serial.printf("收到队友 %s 的抓捕命令，忽略（同队不会被抓）\n", macStr.c_str());
