@@ -1,96 +1,23 @@
-# JIRA Project Information - ESP32-S3 Matrix Nearby Radar
+# CatchGameMod (ESP32-S3 Matrix, ESP-NOW)
+将单文件工程拆分为模块化结构：显示、逻辑、无线、电气配置与全局状态分离。
 
-## Project Summary for JIRA
-**Project Name**: ESP32-S3 Matrix Nearby Radar  
-**Course**: COMP4500  
-**Project Type**: Interactive Art Installation  
-**Status**: Development Complete, Ready for Testing  
+## 目录
+- `CatchGameMod.ino` 入口（setup/loop）
+- `config.h` 常量、枚举、数据包
+- `globals.h / globals.cpp` 全局对象与状态
+- `utils.h / utils.cpp` 工具方法（颜色、按钮、距离换算、边框绘制等）
+- `display.h / display.cpp` 矩阵显示渲染
+- `logic.h / logic.cpp` 游戏逻辑与按键处理
+- `radio.h / radio.cpp` ESP‑NOW 初始化、收发回调、心跳与抓捕
 
-## Epic Description
-Create an interactive art installation that visualizes nearby devices using ESP32-S3 microcontrollers and LED matrices. The system creates a "radar-like" display showing the signal strength of surrounding devices in real-time.
+## 依赖
+- `esp32` 内核
+- `Adafruit_NeoPixel` / `Adafruit_NeoMatrix`
+- WiFi/ESP‑NOW 由 ESP32 SDK 提供
 
-## User Stories
+## 使用
+1. 保证文件夹名与 `.ino` 同名（已为 `CatchGameMod`）。
+2. 使用 Arduino IDE 打开 `.ino` 并选择你的 ESP32‑S3 板卡与端口。
+3. 编译上传即可。
 
-### Story 1: Device Discovery
-**As an** art installation viewer  
-**I want** the system to automatically detect nearby devices  
-**So that** I can see a real-time visualization of the digital environment around me  
-
-**Acceptance Criteria:**
-- [x] System broadcasts heartbeat packets every 1000ms
-- [x] Devices automatically discover each other via ESP-NOW
-- [x] Support for up to 8 simultaneous devices
-- [x] Automatic removal of offline devices after 10 seconds
-
-### Story 2: Signal Strength Visualization
-**As an** art installation viewer  
-**I want** to see signal strength represented visually  
-**So that** I can understand the relative proximity and connection quality of devices  
-
-**Acceptance Criteria:**
-- [x] RSSI values mapped to bar chart heights (0-8 levels)
-- [x] Color gradient from red (weak signal) to green (strong signal)
-- [x] Real-time updates with smoothing algorithm
-- [x] Clear visual feedback when no devices are detected
-
-### Story 3: System Reliability
-**As an** installation maintainer  
-**I want** the system to be stable and self-recovering  
-**So that** the art piece can run continuously without intervention  
-
-**Acceptance Criteria:**
-- [x] Robust error handling for network initialization
-- [x] Automatic peer cleanup to prevent memory leaks
-- [x] Visual startup self-test sequence
-- [x] Configurable brightness and display parameters
-
-## Technical Tasks
-
-### Task 1: Hardware Configuration
-- [x] Configure ESP32-S3 with NeoPixel matrix on GPIO 14/48
-- [x] Set up proper color order (RGB) for display
-- [x] Implement matrix orientation (bottom-left origin)
-- [x] Add startup self-test sequence
-
-### Task 2: Communication Protocol
-- [x] Implement ESP-NOW peer-to-peer communication
-- [x] Design packet structure with magic bytes and sequence numbers
-- [x] Add RSSI smoothing algorithm (alpha = 0.7)
-- [x] Implement heartbeat and timeout mechanisms
-
-### Task 3: Visualization Engine
-- [x] Create bar chart rendering system
-- [x] Implement color mapping for signal strength
-- [x] Add sorting by signal strength (strongest first)
-- [x] Create fallback animation for no-peer state
-
-### Task 4: Code Quality
-- [x] Translate all comments from Chinese to English
-- [x] Add comprehensive inline documentation
-- [x] Implement proper error handling
-- [x] Optimize performance with 80ms update cycles
-
-## Testing Checklist
-- [ ] Single device startup test
-- [ ] Multi-device discovery test
-- [ ] Signal strength accuracy verification
-- [ ] Long-term stability test (24+ hours)
-- [ ] Edge case handling (device join/leave scenarios)
-
-## Deployment Notes
-1. Flash firmware to all ESP32-S3 devices
-2. Ensure all devices use the same WiFi channel (Channel 1)
-3. Place devices in proximity for optimal visualization
-4. Monitor for proper LED matrix orientation and brightness
-5. Verify color accuracy matches signal strength expectations
-
-## Risk Assessment
-- **Low Risk**: Hardware compatibility issues (GPIO pin alternatives available)
-- **Medium Risk**: Network interference in crowded WiFi environments
-- **Low Risk**: Power consumption for extended installations
-
-## Success Metrics
-- All devices successfully discover each other within 5 seconds
-- Accurate signal strength representation with smooth updates
-- Zero crashes during 24-hour continuous operation
-- Visually appealing and responsive art installation experience
+> 如需更换按键或引脚、队伍颜色、冷却时间等，修改 `config.h` 即可。
