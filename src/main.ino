@@ -80,6 +80,11 @@ unsigned long lastButton1Press = 0;
 unsigned long lastButton2Press = 0;
 const unsigned long DEBOUNCE_TIME = 50;
 
+// 长按重置功能
+unsigned long button1PressStartTime = 0;
+bool button1Pressing = false;
+const unsigned long LONG_PRESS_TIME = 3000; // 3秒长按
+
 struct Packet { 
   char magic[4]; 
   uint8_t mac[6]; 
@@ -180,45 +185,96 @@ void handleGameLogic() {
     lastSearchUpdate = now;
   }
   
-  // 按键处理
-  if (readButton(BUTTON1_PIN, lastButton1, lastButton1Press)) {
-    switch(gameState) {
-      case TEAM_SELECT:
-        // 确认选择的队伍，进入等待状态
-        gameState = WAITING;
-        Serial.printf("已选择队伍: %d (", selectedTeam);
-        switch(selectedTeam) {
-          case TEAM_RED: Serial.print("红色"); break;
-          case TEAM_GREEN: Serial.print("绿色"); break;
-          case TEAM_BLUE: Serial.print("蓝色"); break;
-          case TEAM_YELLOW: Serial.print("黄色"); break;
-          default: Serial.print("未知"); break;
-        }
-        Serial.println(") - 按按键1开始游戏");
-        break;
-        
-      case WAITING:
-        gameState = SEARCHING;
-        gameStartTime = now;
-        myTeam = assignTeamByMac(selfMac);
-        Serial.printf("开始搜索设备... 我的队伍: %d (颜色: ", myTeam);
-        switch(myTeam) {
-          case TEAM_RED: Serial.print("红色"); break;
-          case TEAM_GREEN: Serial.print("绿色"); break;
-          case TEAM_BLUE: Serial.print("蓝色"); break;
-          case TEAM_YELLOW: Serial.print("黄色"); break;
-          default: Serial.print("未知"); break;
-        }
-        Serial.println(")");
-        break;
-        
-      case SEARCHING:
-      case PLAYING:
+  // 按键1处理 - 支持长按重置
+  // 注意：根据实际硬件，可能需要反转逻辑
+  // 如果不按时进度条增加，说明逻辑反了，需要改为 == HIGH
+  bool button1Current = digitalRead(BUTTON1_PIN) == HIGH;  // 反转逻辑！
+  
+  // 调试：检测按钮状态变化
+  static bool lastDebugState = false;
+  if (button1Current != lastDebugState) {
+    Serial.printf("[DEBUG] 按钮1状态变化: %s (digitalRead=%d)\n", 
+                  button1Current ? "按下" : "释放", 
+                  digitalRead(BUTTON1_PIN));
+    lastDebugState = button1Current;
+  }
+  
+  // 检测按键1按下（从false变为true）
+  if (button1Current && !button1Pressing) {
+    button1Pressing = true;
+    button1PressStartTime = now;
+    Serial.println("[DEBUG] 开始计时长按");
+  }
+  // 检测按键1释放（从true变为false）
+  else if (!button1Current && button1Pressing) {
+    button1Pressing = false;
+    unsigned long pressDuration = now - button1PressStartTime;
+    Serial.printf("[DEBUG] 按钮释放，持续时长: %.2f秒\n", pressDuration / 1000.0f);
+    
+    // 根据按压时长和游戏状态处理
+    if (gameState == SEARCHING || gameState == PLAYING) {
+      // 在游戏中需要长按3秒才能重置
+      if (pressDuration >= LONG_PRESS_TIME) {
         gameState = TEAM_SELECT;
         myTeam = TEAM_NEUTRAL;
         peers.clear();
-        Serial.println("游戏结束 - 重新选择队伍");
-        break;
+        Serial.println("长按重置 - 游戏结束，重新选择队伍");
+      } else {
+        Serial.printf("需要长按3秒才能重置 (当前: %.1f秒)\n", pressDuration / 1000.0f);
+      }
+    } else {
+      // 在其他状态下，短按即可
+      if (pressDuration < LONG_PRESS_TIME) {
+        switch(gameState) {
+          case TEAM_SELECT:
+            // 确认选择的队伍，进入等待状态
+            gameState = WAITING;
+            Serial.printf("已选择队伍: %d (", selectedTeam);
+            switch(selectedTeam) {
+              case TEAM_RED: Serial.print("红色"); break;
+              case TEAM_GREEN: Serial.print("绿色"); break;
+              case TEAM_BLUE: Serial.print("蓝色"); break;
+              case TEAM_YELLOW: Serial.print("黄色"); break;
+              default: Serial.print("未知"); break;
+            }
+            Serial.println(") - 按按键1开始游戏");
+            break;
+            
+          case WAITING:
+            gameState = SEARCHING;
+            gameStartTime = now;
+            myTeam = assignTeamByMac(selfMac);
+            Serial.printf("开始搜索设备... 我的队伍: %d (颜色: ", myTeam);
+            switch(myTeam) {
+              case TEAM_RED: Serial.print("红色"); break;
+              case TEAM_GREEN: Serial.print("绿色"); break;
+              case TEAM_BLUE: Serial.print("蓝色"); break;
+              case TEAM_YELLOW: Serial.print("黄色"); break;
+              default: Serial.print("未知"); break;
+            }
+            Serial.println(")");
+            break;
+        }
+      }
+    }
+  }
+  
+  // 长按过程中显示进度提示
+  if (button1Pressing && (gameState == SEARCHING || gameState == PLAYING)) {
+    unsigned long pressDuration = now - button1PressStartTime;
+    static unsigned long lastProgressPrint = 0;
+    if (pressDuration >= LONG_PRESS_TIME) {
+      // 已达到3秒，等待释放
+      if (now - lastProgressPrint > 200) {
+        Serial.println(">>> 释放按键以重置游戏 <<<");
+        lastProgressPrint = now;
+      }
+    } else {
+      // 显示进度
+      if (now - lastProgressPrint > 500) {
+        Serial.printf("长按重置中... %.1f/3.0秒\n", pressDuration / 1000.0f);
+        lastProgressPrint = now;
+      }
     }
   }
   
@@ -344,6 +400,15 @@ void updateMatrix() {
             displayCount++;
           }
         }
+        
+        // === 长按重置进度条（覆盖在顶部进度条上） ===
+        if (button1Pressing && button1PressStartTime > 0) {
+          unsigned long pressDuration = millis() - button1PressStartTime;
+          int longPressProgress = map(min(pressDuration, LONG_PRESS_TIME), 0, LONG_PRESS_TIME, 0, 8);
+          for (int i = 0; i < longPressProgress; i++) {
+            matrix.drawPixel(i, 7, matrix.Color(255, 165, 0)); // 橙色进度条覆盖黄色
+          }
+        }
       }
       break;
       
@@ -414,6 +479,15 @@ void updateMatrix() {
         unsigned long elapsed = millis() - lastCaptureTime;
         int progress = map(elapsed, 0, COOLDOWN_TIME_MS, 0, 8);
         for (int i = 0; i < progress; i++) matrix.drawPixel(i, 0, matrix.Color(255, 0, 0));
+      }
+      
+      // === 长按重置进度条（显示在顶部） ===
+      if (button1Pressing && button1PressStartTime > 0) {
+        unsigned long pressDuration = millis() - button1PressStartTime;
+        int longPressProgress = map(min(pressDuration, LONG_PRESS_TIME), 0, LONG_PRESS_TIME, 0, 8);
+        for (int i = 0; i < longPressProgress; i++) {
+          matrix.drawPixel(i, 7, matrix.Color(255, 165, 0)); // 橙色进度条
+        }
       }
     }
     break;
@@ -550,6 +624,24 @@ void setup() {
   // 初始化按键
   pinMode(BUTTON1_PIN, INPUT_PULLUP);
   pinMode(BUTTON2_PIN, INPUT_PULLUP);
+  
+  // 读取初始按钮状态，确保 button1Pressing 正确初始化
+  delay(50); // 等待引脚稳定
+  int rawButton1 = digitalRead(BUTTON1_PIN);
+  bool initialButton1State = (rawButton1 == HIGH);  // 反转逻辑！
+  
+  Serial.printf("按钮1初始状态: digitalRead=%d, 判定为%s\n", 
+                rawButton1, 
+                initialButton1State ? "按下" : "未按下");
+  
+  button1Pressing = false; // 启动时强制设为未按下状态
+  button1PressStartTime = 0; // 清零计时器
+  
+  if (initialButton1State) {
+    Serial.println("警告: 启动时检测到按钮1被按下，请释放按钮");
+  } else {
+    Serial.println("按钮状态正常");
+  }
 
   matrix.begin();
   matrix.setBrightness(40);           // 亮度适中；可调 20~60
@@ -588,6 +680,16 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+  
+  // 调试：每2秒打印一次按钮状态
+  static unsigned long lastDebugPrint = 0;
+  if (now - lastDebugPrint > 2000) {
+    int rawBtn = digitalRead(BUTTON1_PIN);
+    Serial.printf("[MONITOR] 按钮1: digitalRead=%d, button1Pressing=%s\n", 
+                  rawBtn, 
+                  button1Pressing ? "true" : "false");
+    lastDebugPrint = now;
+  }
   
   // 处理游戏逻辑和按键
   handleGameLogic();
