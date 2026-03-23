@@ -1,6 +1,7 @@
 import argparse
 import time
 from pathlib import Path
+from urllib.request import urlretrieve
 
 import cv2
 import numpy as np
@@ -9,6 +10,11 @@ try:
     from ultralytics import YOLO
 except ImportError:
     YOLO = None
+
+try:
+    import mediapipe as mp
+except ImportError:
+    mp = None
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -19,28 +25,157 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int, default=1280, help="Capture width")
     parser.add_argument("--height", type=int, default=720, help="Capture height")
     parser.add_argument("--output", type=str, default="output/person_edge.svg", help="Output SVG path")
-    parser.add_argument("--epsilon", type=float, default=0.01, help="Contour simplify ratio")
+    parser.add_argument("--epsilon", type=float, default=0.0, help="Contour simplify ratio (0 keeps raw contour)")
     parser.add_argument("--model", type=str, default="yolov8n-seg.pt", help="YOLO segmentation model path")
     parser.add_argument("--conf", type=float, default=0.35, help="YOLO confidence threshold")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference size")
-    parser.add_argument("--smooth-iters", type=int, default=2, help="Chaikin smoothing iterations")
-    parser.add_argument("--resample-step", type=float, default=3.0, help="Target pixel step for SVG points")
+    parser.add_argument("--smooth-iters", type=int, default=0, help="Chaikin smoothing iterations")
+    parser.add_argument("--resample-step", type=float, default=0.0, help="Target pixel step for SVG points (0 disables resampling)")
+    parser.add_argument("--mask-open-iters", type=int, default=0, help="Mask opening iterations for noise cleanup")
+    parser.add_argument("--mask-close-iters", type=int, default=0, help="Mask closing iterations for gap filling")
     parser.add_argument(
         "--min-area-ratio",
         type=float,
         default=0.003,
         help="Minimum contour area ratio against full frame",
     )
+    parser.add_argument(
+        "--auto-hold-seconds",
+        type=float,
+        default=2.0,
+        help="How long to hold a V-sign before auto SVG flow starts",
+    )
+    parser.add_argument(
+        "--pose-seconds",
+        type=float,
+        default=5.0,
+        help="Time window after V-sign trigger to pose before auto SVG save",
+    )
     return parser
 
 
+def is_v_sign(hand_landmarks, img_h: int) -> bool:
+    lm = hand_landmarks
+
+    def y(idx: int) -> float:
+        return lm[idx].y * img_h
+
+    index_extended = y(8) < y(6)
+    middle_extended = y(12) < y(10)
+    ring_folded = y(16) > y(14)
+    pinky_folded = y(20) > y(18)
+
+    return index_extended and middle_extended and ring_folded and pinky_folded
+
+
+def ensure_hand_landmarker_model(model_path: Path) -> None:
+    if model_path.exists():
+        return
+
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    model_url = (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+    )
+    urlretrieve(model_url, str(model_path))
+
+
+def init_hand_tracker() -> tuple[object, str]:
+    if hasattr(mp, "solutions"):
+        mp_hands = mp.solutions.hands
+        hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.5,
+        )
+        return (
+            {
+                "backend": "solutions",
+                "hands": hands,
+                "mp_hands": mp_hands,
+                "mp_draw": mp.solutions.drawing_utils,
+            },
+            "solutions",
+        )
+
+    from mediapipe.tasks import python as mp_tasks_python
+    from mediapipe.tasks.python import vision
+
+    model_path = Path("models/hand_landmarker.task")
+    ensure_hand_landmarker_model(model_path)
+
+    options = vision.HandLandmarkerOptions(
+        base_options=mp_tasks_python.BaseOptions(model_asset_path=str(model_path)),
+        running_mode=vision.RunningMode.IMAGE,
+        num_hands=2,
+        min_hand_detection_confidence=0.6,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    hands = vision.HandLandmarker.create_from_options(options)
+    return ({"backend": "tasks", "hands": hands}, "tasks")
+
+
+def detect_v_sign(frame: np.ndarray, hand_tracker) -> tuple[bool, np.ndarray]:
+    preview = frame.copy()
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    has_v_sign = False
+
+    if hand_tracker["backend"] == "solutions":
+        hands = hand_tracker["hands"]
+        results = hands.process(rgb)
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                hand_tracker["mp_draw"].draw_landmarks(preview, hand_landmarks, hand_tracker["mp_hands"].HAND_CONNECTIONS)
+                if is_v_sign(hand_landmarks.landmark, frame.shape[0]):
+                    has_v_sign = True
+        return has_v_sign, preview
+
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    results = hand_tracker["hands"].detect(mp_image)
+    if results.hand_landmarks:
+        h, w = frame.shape[:2]
+        for hand_landmarks in results.hand_landmarks:
+            for lm in hand_landmarks:
+                px = int(lm.x * w)
+                py = int(lm.y * h)
+                if 0 <= px < w and 0 <= py < h:
+                    cv2.circle(preview, (px, py), 2, (255, 200, 0), -1)
+            if is_v_sign(hand_landmarks, h):
+                has_v_sign = True
+
+    return has_v_sign, preview
+
+
+def draw_center_notice(frame: np.ndarray, text: str, color: tuple[int, int, int]) -> None:
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1.35
+    thickness = 4
+    (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+
+    x = max(20, (w - tw) // 2)
+    y = h // 2
+    pad = 18
+
+    cv2.rectangle(
+        frame,
+        (x - pad, y - th - pad),
+        (x + tw + pad, y + pad),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.putText(frame, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
+
+
 def simplify_contour(contour: np.ndarray, epsilon_ratio: float) -> np.ndarray:
-    if contour.shape[0] < 3:
+    if contour.shape[0] < 3 or epsilon_ratio <= 0:
         return contour
 
     contour_cv = contour.reshape((-1, 1, 2)).astype(np.int32)
     peri = cv2.arcLength(contour_cv, True)
-    epsilon = max(0.5, peri * epsilon_ratio)
+    epsilon = peri * epsilon_ratio
     return cv2.approxPolyDP(contour_cv, epsilon, True).reshape((-1, 2))
 
 
@@ -120,6 +255,8 @@ def extract_person_contour_yolo(
     conf: float,
     imgsz: int,
     min_area_ratio: float,
+    mask_open_iters: int,
+    mask_close_iters: int,
 ) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None, str]:
     result = model.predict(
         source=frame,
@@ -144,9 +281,12 @@ def extract_person_contour_yolo(
             if mask.shape[0] != frame_h or mask.shape[1] != frame_w:
                 mask = cv2.resize(mask, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
 
-            kernel = np.ones((5, 5), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+            if mask_open_iters > 0 or mask_close_iters > 0:
+                kernel = np.ones((3, 3), np.uint8)
+                if mask_open_iters > 0:
+                    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=mask_open_iters)
+                if mask_close_iters > 0:
+                    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=mask_close_iters)
 
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             if not contours:
@@ -196,8 +336,11 @@ def main() -> None:
 
     if YOLO is None:
         raise RuntimeError("ultralytics is not installed. Run: pip install ultralytics")
+    if mp is None:
+        raise RuntimeError("mediapipe is not installed. Run: pip install mediapipe")
 
     model = YOLO(args.model)
+    hand_tracker, tracker_backend = init_hand_tracker()
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -209,9 +352,15 @@ def main() -> None:
     output_path = Path(args.output)
     last_saved_path = ""
     last_status = "Waiting for detection"
+    hold_start = None
+    pose_deadline = None
+    queued_contour = None
+    queued_shape = None
 
     print("Camera started.")
     print("Press S to capture SVG, Q to quit.")
+    print(f"Hold V-sign for {args.auto_hold_seconds:.1f}s, then pose for {args.pose_seconds:.1f}s.")
+    print(f"Hand tracker backend: {tracker_backend}")
     print(f"YOLO model: {args.model}")
 
     try:
@@ -227,10 +376,65 @@ def main() -> None:
                 args.conf,
                 args.imgsz,
                 args.min_area_ratio,
+                args.mask_open_iters,
+                args.mask_close_iters,
             )
             last_status = status
+            v_sign_detected, preview = detect_v_sign(frame, hand_tracker)
+            now = time.time()
 
-            preview = frame.copy()
+            if pose_deadline is not None:
+                if contour is not None:
+                    queued_contour = contour.copy()
+                    queued_shape = frame.shape[:2]
+
+                left = pose_deadline - now
+                if left > 0:
+                    gesture_text = f"Pose now... SVG will be saved in {left:.1f}s"
+                    draw_center_notice(preview, gesture_text, (0, 255, 255))
+                else:
+                    if queued_contour is None or queued_shape is None:
+                        print("Auto save blocked: no contour detected during pose window")
+                        draw_center_notice(preview, "No contour found, save failed", (0, 80, 255))
+                    else:
+                        refined = beautify_contour(queued_contour, args.epsilon, args.smooth_iters, args.resample_step)
+                        if refined.shape[0] < 3:
+                            print("Auto save blocked: contour too small after simplify")
+                            draw_center_notice(preview, "Contour too small, save failed", (0, 80, 255))
+                        else:
+                            timestamp = time.strftime("%Y%m%d_%H%M%S")
+                            target = output_path.with_name(f"{output_path.stem}_{timestamp}.svg")
+                            h, w = queued_shape
+                            save_svg(refined, w, h, target)
+                            last_saved_path = str(target)
+                            print(f"Auto SVG saved: {target}")
+                            draw_center_notice(preview, "SVG auto-saved", (80, 255, 80))
+
+                    pose_deadline = None
+                    queued_contour = None
+                    queued_shape = None
+                    hold_start = None
+            else:
+                if v_sign_detected:
+                    if hold_start is None:
+                        hold_start = now
+                    held_secs = now - hold_start
+                    remaining = max(0.0, args.auto_hold_seconds - held_secs)
+                    if held_secs >= args.auto_hold_seconds:
+                        pose_deadline = now + args.pose_seconds
+                        queued_contour = contour.copy() if contour is not None else None
+                        queued_shape = frame.shape[:2] if contour is not None else None
+                        hold_start = None
+                        gesture_text = f"Triggered: start posing for {args.pose_seconds:.0f}s"
+                        draw_center_notice(preview, gesture_text, (0, 255, 255))
+                    else:
+                        gesture_text = f"V-sign detected, hold for {remaining:.1f}s"
+                        draw_center_notice(preview, gesture_text, (80, 255, 80))
+                else:
+                    hold_start = None
+                    gesture_text = "Show a V-sign and hold for 2s"
+                    draw_center_notice(preview, gesture_text, (80, 255, 80))
+
             if roi is not None:
                 x, y, bw, bh = roi
                 cv2.rectangle(preview, (x, y), (x + bw, y + bh), (255, 180, 0), 2)
@@ -242,6 +446,7 @@ def main() -> None:
             line2 = f"Last SVG: {last_saved_path}" if last_saved_path else "Last SVG: none"
             cv2.putText(preview, line1, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(preview, line2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 220), 2, cv2.LINE_AA)
+            cv2.putText(preview, gesture_text, (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (60, 255, 60), 2, cv2.LINE_AA)
 
             cv2.imshow("YOLO Person Edge -> SVG", preview)
 
@@ -266,6 +471,7 @@ def main() -> None:
                 print(f"Saved SVG: {target}")
 
     finally:
+        hand_tracker["hands"].close()
         cap.release()
         cv2.destroyAllWindows()
 

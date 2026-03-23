@@ -22,6 +22,8 @@ Optional arguments are inside CONFIG below.
 from __future__ import annotations
 import math
 import sys
+import os
+import glob
 from dataclasses import dataclass
 from typing import Iterable, List, Tuple
 
@@ -82,10 +84,53 @@ def sample_path(shape: Shape, step: float) -> List[Point]:
     """
     Convert a svgelements shape into a list of points.
     """
+    pts = []
+    
+    # CASE 1: Explicit points (Polyline, Polygon)
+    if hasattr(shape, 'points'):
+        try:
+            # svgelements often stores points as complex numbers or Point objects
+            raw_pts = shape.points
+            if raw_pts:
+                for p in raw_pts:
+                    # Handle complex numbers (x + yj) commonly used
+                    if isinstance(p, complex):
+                        pts.append((p.real, p.imag))
+                        continue
+                    
+                    # Handle Point objects or tuples
+                    x, y = 0.0, 0.0
+                    if hasattr(p, 'x') and hasattr(p, 'y'):
+                        x, y = float(p.x), float(p.y)
+                    elif isinstance(p, (list, tuple)) and len(p) >= 2:
+                        x, y = float(p[0]), float(p[1])
+                    elif hasattr(p, 'real') and hasattr(p, 'imag'): # fallback for complex-like
+                        x, y = float(p.real), float(p.imag)
+                    else:
+                        # try indexing
+                        try:
+                            x, y = float(p[0]), float(p[1])
+                        except:
+                            continue
+                            
+                    pts.append((x, y))
+                
+                if len(pts) > 1:
+                    return deduplicate_points(pts)
+        except Exception as e:
+            print(f"DEBUG: Error reading shape.points: {e}")
+            pass
+
+    # CASE 2: Use as_path() for general shapes (Path, Circle, Rect, etc)
     if not hasattr(shape, "as_path"):
         return []
 
-    path: Path = shape.as_path()
+    try:
+        path: Path = shape.as_path()
+    except Exception as e:
+        print(f"DEBUG: as_path() failed: {e}")
+        return []
+
     if len(path) == 0:
         return []
 
@@ -130,15 +175,30 @@ def deduplicate_points(points: List[Point], eps: float = 1e-9) -> List[Point]:
 
 
 def extract_polylines(svg_file: str, step: float) -> List[List[Point]]:
-    svg = SVG.parse(svg_file)
+    # Print what file we are trying to parse
+    print(f"Parsing SVG file: {svg_file}")
+    
+    try:
+        svg = SVG.parse(svg_file)
+    except Exception as e:
+        print(f"FAILED to parse SVG: {e}")
+        return []
+
     polylines: List[List[Point]] = []
 
-    for elem in svg.elements():
-        # Skip root/container-like entries
-        if not isinstance(elem, Shape):
+    # Iterate over ALL elements to debug
+    for i, elem in enumerate(svg.elements()):
+        # print(f"Element {i}: {type(elem)}")        
+        
+        # Check for Shape or specific types we know
+        is_shape = isinstance(elem, Shape)
+        has_path = hasattr(elem, 'as_path')
+        
+        # If it's a structural element (Group, SVG, etc), skip unless it has a path
+        if not is_shape and not has_path:
             continue
 
-        # Ignore invisible elements
+        # Skip invisible
         try:
             if elem.values.get("visibility") == "hidden":
                 continue
@@ -146,11 +206,17 @@ def extract_polylines(svg_file: str, step: float) -> List[List[Point]]:
                 continue
         except Exception:
             pass
-
+            
+        # Try to sample
         pts = sample_path(elem, step)
-        if len(pts) >= 2:
+        
+        if pts and len(pts) >= 2:
             polylines.append(pts)
+        else:
+            # print(f"  -> No points extracted from {type(elem)}")
+            pass
 
+    print(f"Extracted {len(polylines)} polylines.")
     return polylines
 
 
@@ -293,12 +359,27 @@ def convert_svg_to_gcode(svg_file: str, gcode_file: str, cfg: Config) -> None:
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: python svg_to_gcode.py input.svg output.ngc")
-        sys.exit(1)
+    if len(sys.argv) == 3:
+        svg_file = sys.argv[1]
+        gcode_file = sys.argv[2]
+    else:
+        # Default to latest SVG in output directory
+        print("No arguments provided. Looking for latest SVG in output folder...")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        output_dir = os.path.join(script_dir, "..", "output")
+        svg_files = glob.glob(os.path.join(output_dir, "*.svg"))
 
-    svg_file = sys.argv[1]
-    gcode_file = sys.argv[2]
+        if not svg_files:
+            print(f"No SVG files found in {output_dir}")
+            print("Usage: python svg_to_gcode.py [input.svg] [output.ngc]")
+            sys.exit(1)
+
+        # Sort by modification time
+        svg_file = max(svg_files, key=os.path.getmtime)
+        # Generate output filename in same folder, replacing extension
+        gcode_file = os.path.splitext(svg_file)[0] + ".ngc"
+        print(f"Auto-selected input: {svg_file}")
+        print(f"Auto-selected output: {gcode_file}")
 
     try:
         convert_svg_to_gcode(svg_file, gcode_file, CONFIG)
