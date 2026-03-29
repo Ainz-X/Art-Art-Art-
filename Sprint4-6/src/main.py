@@ -19,7 +19,7 @@ except ImportError:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Use YOLO to detect person contour and export a single-line SVG."
+        description="Use YOLO to detect person contours and export an SVG."
     )
     parser.add_argument("--camera", type=int, default=0, help="Camera index")
     parser.add_argument("--width", type=int, default=1280, help="Capture width")
@@ -29,6 +29,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=str, default="yolov8n-seg.pt", help="YOLO segmentation model path")
     parser.add_argument("--conf", type=float, default=0.35, help="YOLO confidence threshold")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference size")
+    parser.add_argument(
+        "--max-people",
+        type=int,
+        default=0,
+        help="Max number of people to keep (0 keeps all detections)",
+    )
     parser.add_argument("--smooth-iters", type=int, default=0, help="Chaikin smoothing iterations")
     parser.add_argument("--resample-step", type=float, default=0.0, help="Target pixel step for SVG points (0 disables resampling)")
     parser.add_argument("--mask-open-iters", type=int, default=0, help="Mask opening iterations for noise cleanup")
@@ -169,6 +175,49 @@ def draw_center_notice(frame: np.ndarray, text: str, color: tuple[int, int, int]
     cv2.putText(frame, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
 
 
+def draw_hud_panel(frame: np.ndarray, people_count: int) -> None:
+    text = f"{people_count} person"
+    x0, y0 = 18, 16
+    panel_w = 220
+    panel_h = 58
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), (12, 12, 12), -1)
+    cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+    cv2.rectangle(frame, (x0, y0), (x0 + panel_w, y0 + panel_h), (45, 210, 255), 2)
+    cv2.putText(frame, text, (x0 + 14, y0 + 39), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (80, 255, 120), 2, cv2.LINE_AA)
+
+
+def draw_flash_countdown(frame: np.ndarray, seconds_left: float) -> None:
+    if seconds_left > 5.0 or seconds_left <= 0:
+        return
+
+    value = int(np.ceil(seconds_left))
+    value = max(1, min(5, value))
+    progress = float(value) - float(seconds_left)
+    show_digit = progress <= 0.58
+
+    if not show_digit:
+        return
+
+    h, w = frame.shape[:2]
+    text = str(value)
+    scale = 8.0 - (progress * 2.0)
+    scale = max(5.6, scale)
+    thickness = 14
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, scale, thickness)
+    x = (w - tw) // 2
+    y = (h + th) // 2
+
+    overlay = frame.copy()
+    pad = 46
+    cv2.rectangle(overlay, (x - pad, y - th - pad), (x + tw + pad, y + pad), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.50, frame, 0.50, 0, frame)
+
+    cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_DUPLEX, scale, (20, 20, 20), thickness + 8, cv2.LINE_AA)
+    cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_DUPLEX, scale, (40, 245, 255), thickness, cv2.LINE_AA)
+
+
 def simplify_contour(contour: np.ndarray, epsilon_ratio: float) -> np.ndarray:
     if contour.shape[0] < 3 or epsilon_ratio <= 0:
         return contour
@@ -236,14 +285,21 @@ def beautify_contour(contour: np.ndarray, epsilon_ratio: float, smooth_iters: in
     return resample_closed_contour(smoothed, resample_step)
 
 
-def save_svg(contour: np.ndarray, width: int, height: int, output_path: Path) -> None:
+def save_svg(contours: list[np.ndarray], width: int, height: int, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    points = " ".join(f"{int(x)},{int(y)}" for x, y in contour)
+    polyline_lines = []
+    for contour in contours:
+        points = " ".join(f"{int(x)},{int(y)}" for x, y in contour)
+        polyline_lines.append(
+            f'  <polyline points="{points}" fill="none" stroke="black" stroke-width="2" '
+            f'stroke-linejoin="round" stroke-linecap="round" />'
+        )
+
+    polyline_block = "\n".join(polyline_lines)
     svg_text = (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}">\n'
-        f'  <polyline points="{points}" fill="none" stroke="black" stroke-width="2" '
-        f'stroke-linejoin="round" stroke-linecap="round" />\n'
+        f"{polyline_block}\n"
         "</svg>\n"
     )
     output_path.write_text(svg_text, encoding="utf-8")
@@ -254,10 +310,11 @@ def extract_person_contour_yolo(
     model,
     conf: float,
     imgsz: int,
+    max_people: int,
     min_area_ratio: float,
     mask_open_iters: int,
     mask_close_iters: int,
-) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None, str]:
+) -> tuple[list[np.ndarray], list[tuple[int, int, int, int]], str]:
     result = model.predict(
         source=frame,
         conf=conf,
@@ -269,13 +326,14 @@ def extract_person_contour_yolo(
 
     frame_h, frame_w = frame.shape[:2]
     min_area = float(frame_h * frame_w) * min_area_ratio
+    max_keep = max_people if max_people > 0 else None
 
     if result.masks is not None and result.boxes is not None and len(result.boxes) > 0:
         masks = result.masks.data.cpu().numpy()
         boxes_xyxy = result.boxes.xyxy.cpu().numpy().astype(np.int32)
         scores = result.boxes.conf.cpu().numpy()
 
-        best_item = None
+        found_items = []
         for idx, raw_mask in enumerate(masks):
             mask = (raw_mask > 0.5).astype(np.uint8) * 255
             if mask.shape[0] != frame_h or mask.shape[1] != frame_w:
@@ -300,35 +358,51 @@ def extract_person_contour_yolo(
             weight = area * float(scores[idx])
             x1, y1, x2, y2 = boxes_xyxy[idx]
             bbox = (int(x1), int(y1), int(max(1, x2 - x1)), int(max(1, y2 - y1)))
-            if best_item is None or weight > best_item[0]:
-                best_item = (weight, contour, bbox)
+            contour_xy = contour.squeeze(axis=1)
+            if contour_xy.ndim != 2 or contour_xy.shape[0] < 3:
+                continue
+            found_items.append((weight, contour_xy.astype(np.int32), bbox))
 
-        if best_item is None:
-            return None, None, "YOLO found person but mask is too small"
+        if not found_items:
+            return [], [], "YOLO found person but mask is too small"
 
-        contour = best_item[1].squeeze(axis=1)
-        if contour.ndim != 2 or contour.shape[0] < 3:
-            return None, None, "Invalid contour from segmentation"
-        return contour.astype(np.int32), best_item[2], "Person segmented"
+        found_items.sort(key=lambda item: item[0], reverse=True)
+        if max_keep is not None:
+            found_items = found_items[:max_keep]
+
+        contours = [item[1] for item in found_items]
+        rois = [item[2] for item in found_items]
+        return contours, rois, f"Segmented {len(contours)} person(s)"
 
     if result.boxes is not None and len(result.boxes) > 0:
         boxes_xyxy = result.boxes.xyxy.cpu().numpy().astype(np.int32)
         scores = result.boxes.conf.cpu().numpy()
-        best_idx = int(np.argmax(scores))
-        x1, y1, x2, y2 = boxes_xyxy[best_idx]
-        bw = max(1, x2 - x1)
-        bh = max(1, y2 - y1)
-        bbox_area = float(bw * bh)
-        if bbox_area < min_area:
-            return None, None, "YOLO box too small"
+        order = np.argsort(scores)[::-1]
+        if max_keep is not None:
+            order = order[:max_keep]
 
-        contour = np.array(
-            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
-            dtype=np.int32,
-        )
-        return contour, (int(x1), int(y1), int(bw), int(bh)), "Using YOLO bounding box"
+        contours = []
+        rois = []
+        for idx in order:
+            x1, y1, x2, y2 = boxes_xyxy[int(idx)]
+            bw = max(1, x2 - x1)
+            bh = max(1, y2 - y1)
+            bbox_area = float(bw * bh)
+            if bbox_area < min_area:
+                continue
 
-    return None, None, "No person detected"
+            contour = np.array(
+                [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                dtype=np.int32,
+            )
+            contours.append(contour)
+            rois.append((int(x1), int(y1), int(bw), int(bh)))
+
+        if contours:
+            return contours, rois, f"Using {len(contours)} YOLO bounding box(es)"
+        return [], [], "YOLO box too small"
+
+    return [], [], "No person detected"
 
 
 def main() -> None:
@@ -354,7 +428,7 @@ def main() -> None:
     last_status = "Waiting for detection"
     hold_start = None
     pose_deadline = None
-    queued_contour = None
+    queued_contours = None
     queued_shape = None
 
     print("Camera started.")
@@ -370,11 +444,12 @@ def main() -> None:
                 print("Failed to read frame from camera.")
                 break
 
-            contour, roi, status = extract_person_contour_yolo(
+            contours, rois, status = extract_person_contour_yolo(
                 frame,
                 model,
                 args.conf,
                 args.imgsz,
+                args.max_people,
                 args.min_area_ratio,
                 args.mask_open_iters,
                 args.mask_close_iters,
@@ -382,36 +457,42 @@ def main() -> None:
             last_status = status
             v_sign_detected, preview = detect_v_sign(frame, hand_tracker)
             now = time.time()
+            gesture_text = ""
 
             if pose_deadline is not None:
-                if contour is not None:
-                    queued_contour = contour.copy()
+                if contours:
+                    queued_contours = [contour.copy() for contour in contours]
                     queued_shape = frame.shape[:2]
 
                 left = pose_deadline - now
                 if left > 0:
                     gesture_text = f"Pose now... SVG will be saved in {left:.1f}s"
-                    draw_center_notice(preview, gesture_text, (0, 255, 255))
+                    draw_flash_countdown(preview, left)
                 else:
-                    if queued_contour is None or queued_shape is None:
+                    if queued_contours is None or queued_shape is None:
                         print("Auto save blocked: no contour detected during pose window")
                         draw_center_notice(preview, "No contour found, save failed", (0, 80, 255))
                     else:
-                        refined = beautify_contour(queued_contour, args.epsilon, args.smooth_iters, args.resample_step)
-                        if refined.shape[0] < 3:
+                        refined_contours = []
+                        for contour in queued_contours:
+                            refined = beautify_contour(contour, args.epsilon, args.smooth_iters, args.resample_step)
+                            if refined.shape[0] >= 3:
+                                refined_contours.append(refined)
+
+                        if not refined_contours:
                             print("Auto save blocked: contour too small after simplify")
                             draw_center_notice(preview, "Contour too small, save failed", (0, 80, 255))
                         else:
                             timestamp = time.strftime("%Y%m%d_%H%M%S")
                             target = output_path.with_name(f"{output_path.stem}_{timestamp}.svg")
                             h, w = queued_shape
-                            save_svg(refined, w, h, target)
+                            save_svg(refined_contours, w, h, target)
                             last_saved_path = str(target)
                             print(f"Auto SVG saved: {target}")
                             draw_center_notice(preview, "SVG auto-saved", (80, 255, 80))
 
                     pose_deadline = None
-                    queued_contour = None
+                    queued_contours = None
                     queued_shape = None
                     hold_start = None
             else:
@@ -422,8 +503,8 @@ def main() -> None:
                     remaining = max(0.0, args.auto_hold_seconds - held_secs)
                     if held_secs >= args.auto_hold_seconds:
                         pose_deadline = now + args.pose_seconds
-                        queued_contour = contour.copy() if contour is not None else None
-                        queued_shape = frame.shape[:2] if contour is not None else None
+                        queued_contours = [contour.copy() for contour in contours] if contours else None
+                        queued_shape = frame.shape[:2] if contours else None
                         hold_start = None
                         gesture_text = f"Triggered: start posing for {args.pose_seconds:.0f}s"
                         draw_center_notice(preview, gesture_text, (0, 255, 255))
@@ -435,18 +516,14 @@ def main() -> None:
                     gesture_text = "Show a V-sign and hold for 2s"
                     draw_center_notice(preview, gesture_text, (80, 255, 80))
 
-            if roi is not None:
+            for roi in rois:
                 x, y, bw, bh = roi
                 cv2.rectangle(preview, (x, y), (x + bw, y + bh), (255, 180, 0), 2)
 
-            if contour is not None:
+            for contour in contours:
                 cv2.polylines(preview, [contour.reshape((-1, 1, 2))], True, (0, 255, 0), 2)
 
-            line1 = f"Status: {last_status}"
-            line2 = f"Last SVG: {last_saved_path}" if last_saved_path else "Last SVG: none"
-            cv2.putText(preview, line1, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(preview, line2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 220), 2, cv2.LINE_AA)
-            cv2.putText(preview, gesture_text, (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (60, 255, 60), 2, cv2.LINE_AA)
+            draw_hud_panel(preview, len(contours))
 
             cv2.imshow("YOLO Person Edge -> SVG", preview)
 
@@ -454,19 +531,24 @@ def main() -> None:
             if key == ord("q"):
                 break
             if key == ord("s"):
-                if contour is None:
+                if not contours:
                     print(f"Save blocked: {last_status}")
                     continue
 
-                refined = beautify_contour(contour, args.epsilon, args.smooth_iters, args.resample_step)
-                if refined.shape[0] < 3:
+                refined_contours = []
+                for contour in contours:
+                    refined = beautify_contour(contour, args.epsilon, args.smooth_iters, args.resample_step)
+                    if refined.shape[0] >= 3:
+                        refined_contours.append(refined)
+
+                if not refined_contours:
                     print("Save blocked: contour too small after simplify")
                     continue
 
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 target = output_path.with_name(f"{output_path.stem}_{timestamp}.svg")
                 h, w = frame.shape[:2]
-                save_svg(refined, w, h, target)
+                save_svg(refined_contours, w, h, target)
                 last_saved_path = str(target)
                 print(f"Saved SVG: {target}")
 
