@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Art Plotter</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       #0f1117;
+  --surface:  #1a1d27;
+  --surface2: #22263a;
+  --border:   #2e3347;
+  --text:     #e2e8f0;
+  --muted:    #6b7280;
+  --accent:   #3b82f6;
+  --green:    #22c55e;
+  --orange:   #f97316;
+  --red:      #ef4444;
+  --purple:   #a78bfa;
+}
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Header ── */
+header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 18px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  min-height: 52px;
+}
+header h1 { font-size: 1rem; font-weight: 700; letter-spacing: .02em; }
+#status-badge {
+  padding: 3px 11px;
+  border-radius: 20px;
+  font-size: .78rem;
+  font-weight: 700;
+  letter-spacing: .06em;
+  transition: background .3s, color .3s;
+}
+#status-msg { font-size: .82rem; color: var(--muted); margin-left: 4px; }
+#countdown-badge {
+  margin-left: auto;
+  font-size: 1.3rem;
+  font-weight: 800;
+  color: var(--orange);
+  min-width: 54px;
+  text-align: right;
+  display: none;
+}
+
+/* Status badge colours */
+.s-READY       { background:#1f2937; color:#9ca3af; }
+.s-DETECTING   { background:#14532d; color:#86efac; }
+.s-COUNTDOWN   { background:#7c2d12; color:#fed7aa; }
+.s-CAPTURING   { background:#1e3a8a; color:#93c5fd; }
+.s-CONVERTING  { background:#4c1d95; color:#c4b5fd; }
+.s-PLOTTING    { background:#1e2a5e; color:#818cf8; }
+.s-DONE        { background:#14532d; color:#4ade80; }
+.s-ERROR       { background:#7f1d1d; color:#fca5a5; }
+
+/* ── Layout ── */
+.layout {
+  display: grid;
+  grid-template-columns: 1fr 300px;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ── Video area ── */
+.feeds {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  overflow: hidden;
+}
+.video-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  flex: 1;
+  min-height: 0;
+}
+.video-panel {
+  background: #000;
+  border-radius: 8px;
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.video-panel img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.video-label {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  background: rgba(0,0,0,.65);
+  backdrop-filter: blur(4px);
+  padding: 3px 9px;
+  border-radius: 5px;
+  font-size: .72rem;
+  color: #ccc;
+  font-weight: 600;
+}
+
+/* ── Status bar ── */
+.status-bar {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 14px;
+  font-size: .82rem;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-shrink: 0;
+}
+#bar-status { font-weight: 600; }
+#bar-msg    { color: var(--muted); }
+#bar-file   { margin-left: auto; color: var(--muted); font-size: .75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+
+/* ── Settings panel ── */
+.controls {
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  padding: 14px 14px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.section-title {
+  font-size: .7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  color: var(--muted);
+  margin-bottom: 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Action buttons */
+.btn-group { display: flex; flex-direction: column; gap: 7px; }
+.btn {
+  width: 100%;
+  padding: 10px;
+  border: none;
+  border-radius: 8px;
+  font-size: .88rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter .15s, opacity .15s;
+}
+.btn:hover:not(:disabled) { filter: brightness(1.15); }
+.btn:disabled { opacity: .38; cursor: not-allowed; }
+.btn-primary   { background: var(--accent); color: #fff; }
+.btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+.btn-danger    { background: #7f1d1d; color: #fca5a5; }
+
+/* Preset pills */
+.presets { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 10px; }
+.pill {
+  padding: 4px 11px;
+  font-size: .74rem;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: var(--surface2);
+  color: var(--text);
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.pill:hover { background: var(--border); border-color: #4b5563; }
+.pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* Fields */
+.field { margin-bottom: 11px; }
+.field:last-child { margin-bottom: 0; }
+.field label { display: block; font-size: .77rem; color: var(--muted); margin-bottom: 5px; }
+.field input[type=number],
+.field input[type=text],
+.field select {
+  width: 100%;
+  padding: 7px 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: .84rem;
+}
+.field input:focus,
+.field select:focus { outline: none; border-color: var(--accent); }
+
+/* Range slider */
+.range-row { display: flex; align-items: center; gap: 8px; }
+.range-row input[type=range] { flex: 1; accent-color: var(--accent); }
+.range-val { font-size: .78rem; color: var(--muted); min-width: 44px; text-align: right; }
+
+/* Toggle switch */
+.toggle-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
+.toggle-row label:first-child { font-size: .84rem; }
+.toggle { position: relative; width: 42px; height: 24px; flex-shrink: 0; }
+.toggle input { opacity: 0; width: 0; height: 0; }
+.slider {
+  position: absolute; inset: 0;
+  background: #374151; border-radius: 12px; cursor: pointer; transition: .2s;
+}
+.slider::before {
+  content: "";
+  position: absolute;
+  height: 18px; width: 18px;
+  left: 3px; bottom: 3px;
+  background: #fff; border-radius: 50%; transition: .2s;
+}
+.toggle input:checked + .slider { background: var(--accent); }
+.toggle input:checked + .slider::before { transform: translateX(18px); }
+
+/* Info note */
+.note { font-size: .72rem; color: var(--muted); line-height: 1.5; margin-top: 6px; }
+
+/* ── Responsive ── */
+@media (max-width: 720px) {
+  .layout { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+  .controls { max-height: 44vh; border-left: none; border-top: 1px solid var(--border); }
+  .video-row { grid-template-columns: 1fr; }
+  body { overflow: auto; }
+}
+</style>
+</head>
+<body>
+
+<!-- ── Header ──────────────────────────────────────────────────────────────── -->
+<header>
+  <h1>AI Art Plotter</h1>
+  <span id="status-badge" class="s-READY">READY</span>
+  <span id="status-msg"></span>
+  <span id="countdown-badge"></span>
+</header>
+
+<!-- ── Main layout ─────────────────────────────────────────────────────────── -->
+<div class="layout">
+
+  <!-- Edge Detection feed + status bar -->
+  <section class="feeds">
+    <div class="video-row">
+      <div class="video-panel">
+        <img id="edge-img" src="/edge_feed" alt="Edge Detection">
+        <span class="video-label">Edge Detection</span>
+      </div>
+    </div>
+    <div class="status-bar">
+      <span id="bar-status">READY</span>
+      <span id="bar-msg">Waiting for subject…</span>
+      <span id="bar-file"></span>
+    </div>
+  </section>
+
+  <!-- Settings panel -->
+  <aside class="controls">
+
+    <!-- Actions -->
+    <div>
+      <div class="section-title">Actions</div>
+      <div class="btn-group">
+        <button class="btn btn-primary"   id="btn-capture" onclick="doCapture()">Capture Now</button>
+        <button class="btn btn-secondary" id="btn-plot"    onclick="doPlot()" disabled>Plot Last</button>
+        <button class="btn btn-danger"    id="btn-stop"    onclick="doStop()" style="display:none">Force Stop</button>
+        <button class="btn btn-secondary" id="btn-border"  onclick="doBorderTest()">Border Test</button>
+        <button class="btn btn-secondary" id="btn-reset"   onclick="doReset()">Reset</button>
+      </div>
+    </div>
+
+    <!-- Plot scale -->
+    <div>
+      <div class="section-title">Plot Scale</div>
+      <div class="presets" id="preset-pills">
+        <span class="pill active" onclick="setPreset(210,297,'A4')">A4</span>
+        <span class="pill" onclick="setPreset(297,420,'A3')">A3</span>
+        <span class="pill" onclick="setPreset(420,594,'A2')">A2</span>
+        <span class="pill" onclick="setPreset(594,841,'A1')">A1</span>
+        <span class="pill" onclick="setPreset(841,1189,'A0')">A0</span>
+        <span class="pill" onclick="setPreset(500,500,'500')">500mm</span>
+        <span class="pill" onclick="setPreset(1000,1000,'1m')">1 m</span>
+        <span class="pill" onclick="setPreset(2000,1000,'2x1m')">2×1 m</span>
+        <span class="pill" onclick="setPreset(5000,2000,'5x2m')">5×2 m</span>
+      </div>
+      <div class="field">
+        <label>Width (mm)</label>
+        <input type="number" id="target_width_mm" value="210" min="10" max="5000"
+               onchange="save('target_width_mm', +this.value); clearPreset()">
+      </div>
+      <div class="field">
+        <label>Height (mm)</label>
+        <input type="number" id="target_height_mm" value="297" min="10" max="2000"
+               onchange="save('target_height_mm', +this.value); clearPreset()">
+      </div>
+    </div>
+
+    <!-- Display -->
+    <div>
+      <div class="section-title">Display</div>
+      <div class="toggle-row">
+        <label>Mirror Image</label>
+        <label class="toggle">
+          <input type="checkbox" id="mirror" onchange="save('mirror', this.checked)">
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Speed -->
+    <div>
+      <div class="section-title">Speed</div>
+      <div class="field">
+        <label>Draw Speed (mm/min)</label>
+        <div class="range-row">
+          <input type="range" id="draw_feed" min="100" max="5000" step="50" value="1500"
+                 oninput="document.getElementById('draw_feed_v').textContent=this.value; save('draw_feed',+this.value)">
+          <span class="range-val" id="draw_feed_v">1500</span>
+        </div>
+      </div>
+      <div class="field">
+        <label>Travel Speed (mm/min)</label>
+        <div class="range-row">
+          <input type="range" id="travel_feed" min="100" max="10000" step="100" value="3000"
+                 oninput="document.getElementById('travel_feed_v').textContent=this.value; save('travel_feed',+this.value)">
+          <span class="range-val" id="travel_feed_v">3000</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Plotter type -->
+    <div>
+      <div class="section-title">Plotter Type</div>
+      <div class="field">
+        <label>Kinematics</label>
+        <select id="plotter_type" onchange="save('plotter_type', this.value); updatePlotterNote()">
+          <option value="cartesian">Cartesian</option>
+          <option value="corexy">CoreXY / H-bot</option>
+          <option value="polar">Polar</option>
+        </select>
+      </div>
+      <p class="note" id="plotter-note">
+        Standard X/Y G-code — works with GRBL, Marlin, etc.
+      </p>
+    </div>
+
+    <!-- Workflow -->
+    <div>
+      <div class="section-title">Workflow</div>
+      <div class="toggle-row">
+        <label>Auto-Plot After Capture</label>
+        <label class="toggle">
+          <input type="checkbox" id="auto_plot" checked onchange="save('auto_plot', this.checked)">
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Detection -->
+    <div>
+      <div class="section-title">Detection</div>
+      <div class="field">
+        <label>Confidence Threshold</label>
+        <div class="range-row">
+          <input type="range" id="conf" min="0.1" max="0.9" step="0.05" value="0.25"
+                 oninput="document.getElementById('conf_v').textContent=parseFloat(this.value).toFixed(2); save('conf',+this.value)">
+          <span class="range-val" id="conf_v">0.25</span>
+        </div>
+      </div>
+      <div class="field">
+        <label>Lock-in Time (s)</label>
+        <input type="number" id="auto_trigger_seconds" value="2" min="0.5" max="10" step="0.5"
+               onchange="save('auto_trigger_seconds', +this.value)">
+      </div>
+      <div class="field">
+        <label>Pose Countdown (s)</label>
+        <input type="number" id="pose_seconds" value="5" min="1" max="30" step="1"
+               onchange="save('pose_seconds', +this.value)">
+      </div>
+    </div>
+
+    <!-- Pen / Z -->
+    <div>
+      <div class="section-title">Pen / Z Axis</div>
+      <div class="field">
+        <label>Pen Up Z (mm)</label>
+        <input type="number" id="pen_up_z" value="5" step="0.5"
+               onchange="save('pen_up_z', +this.value)">
+      </div>
+      <div class="field">
+        <label>Pen Down Z (mm)</label>
+        <input type="number" id="pen_down_z" value="0" step="0.5"
+               onchange="save('pen_down_z', +this.value)">
+      </div>
+    </div>
+
+    <!-- Connection -->
+    <div>
+      <div class="section-title">Plotter Connection</div>
+      <div class="field">
+        <label>USB Port</label>
+        <input type="text" id="usb_port" value="/dev/ttyUSB0"
+               onchange="save('usb_port', this.value)">
+      </div>
+      <div class="field">
+        <label>Baud Rate</label>
+        <select id="baud_rate" onchange="save('baud_rate', +this.value)">
+          <option value="9600">9600</option>
+          <option value="115200" selected>115200</option>
+          <option value="250000">250000</option>
+        </select>
+      </div>
+    </div>
+
+  </aside>
+</div><!-- /layout -->
+
+<script>
+// ── Utilities ────────────────────────────────────────────────────────────────
+async function save(key, value) {
+  try {
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [key]: value })
+    });
+  } catch (e) {}
+}
+
+function setPreset(w, h, label) {
+  document.getElementById('target_width_mm').value = w;
+  document.getElementById('target_height_mm').value = h;
+  save('target_width_mm', w);
+  save('target_height_mm', h);
+  document.querySelectorAll('#preset-pills .pill').forEach(p => {
+    p.classList.toggle('active', p.textContent.trim() === label);
+  });
+}
+
+function clearPreset() {
+  document.querySelectorAll('#preset-pills .pill').forEach(p => p.classList.remove('active'));
+}
+
+async function doCapture()    { await fetch('/api/capture',     { method: 'POST' }); }
+async function doStop()       { await fetch('/api/stop',         { method: 'POST' }); }
+async function doReset()      { await fetch('/api/reset',        { method: 'POST' }); }
+async function doBorderTest() { await fetch('/api/border_test',  { method: 'POST' }); }
+async function doPlot() {
+  const r = await fetch('/api/plot', { method: 'POST' });
+  if (!r.ok) { const d = await r.json(); alert(d.error || 'Plot failed'); }
+}
+
+// ── Plotter note text ─────────────────────────────────────────────────────────
+const PLOTTER_NOTES = {
+  cartesian: 'Standard X/Y G-code — works with GRBL, Marlin, etc.',
+  corexy:    'Same G-code as Cartesian. Enable CoreXY in GRBL firmware ($32=1 on some builds). Your software output does not change.',
+  polar:     'Experimental: X/Y coordinates are post-processed into radius/angle. Requires polar-capable firmware (e.g. Polargraph). Origin = plotter centre.'
+};
+function updatePlotterNote() {
+  const v = document.getElementById('plotter_type').value;
+  document.getElementById('plotter-note').textContent = PLOTTER_NOTES[v] || '';
+}
+
+// ── Status polling ────────────────────────────────────────────────────────────
+const STATUS_CLASS = {
+  READY: 's-READY', DETECTING: 's-DETECTING', COUNTDOWN: 's-COUNTDOWN',
+  CAPTURING: 's-CAPTURING', CONVERTING: 's-CONVERTING', PLOTTING: 's-PLOTTING',
+  DONE: 's-DONE', ERROR: 's-ERROR'
+};
+
+let _doneTimer = null;
+
+async function pollStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+
+    const badge   = document.getElementById('status-badge');
+    const cdBadge = document.getElementById('countdown-badge');
+    const busy    = ['CAPTURING','CONVERTING','PLOTTING'].includes(d.status);
+    const plotting = d.status === 'PLOTTING';
+
+    // Badge
+    badge.className   = STATUS_CLASS[d.status] || 's-READY';
+    badge.textContent = d.status;
+
+    // Header message
+    const msg = d.error ? ('ERROR: ' + d.error) : (d.message || '');
+    document.getElementById('status-msg').textContent = msg;
+
+    // Countdown in header (pose countdown)
+    if (d.status === 'COUNTDOWN' && d.countdown > 0) {
+      cdBadge.style.display = 'block';
+      cdBadge.textContent   = d.countdown.toFixed(1) + 's';
+    } else {
+      cdBadge.style.display = 'none';
+    }
+
+    // Status bar
+    document.getElementById('bar-status').textContent = d.status;
+    document.getElementById('bar-msg').textContent    = d.error ? d.error : (d.message || '');
+
+    // Last file
+    if (d.last_gcode) {
+      document.getElementById('bar-file').textContent      = d.last_gcode.split('/').pop();
+      document.getElementById('btn-plot').disabled         = busy;
+    }
+
+    // Button visibility
+    document.getElementById('btn-capture').disabled = busy;
+    document.getElementById('btn-stop').style.display  = plotting ? 'block' : 'none';
+    document.getElementById('btn-reset').style.display = plotting ? 'none'  : 'block';
+
+    // DONE — show auto-reset countdown in header
+    if (d.status === 'DONE') {
+      if (!_doneTimer) {
+        let secs = 6;
+        cdBadge.style.display = 'block';
+        cdBadge.style.color   = 'var(--green)';
+        _doneTimer = setInterval(() => {
+          secs--;
+          cdBadge.textContent = `↺ ${secs}s`;
+          if (secs <= 0) { clearInterval(_doneTimer); _doneTimer = null; cdBadge.style.display = 'none'; cdBadge.style.color = ''; }
+        }, 1000);
+      }
+    } else {
+      if (_doneTimer) { clearInterval(_doneTimer); _doneTimer = null; }
+    }
+
+  } catch (e) {}
+  setTimeout(pollStatus, 500);
+}
+
+// ── Load settings on startup ──────────────────────────────────────────────────
+async function loadSettings() {
+  try {
+    const r = await fetch('/api/settings');
+    const s = await r.json();
+    if (s.target_width_mm)  document.getElementById('target_width_mm').value  = s.target_width_mm;
+    if (s.target_height_mm) document.getElementById('target_height_mm').value = s.target_height_mm;
+    document.getElementById('mirror').checked     = s.mirror;
+    document.getElementById('auto_plot').checked  = s.auto_plot;
+    document.getElementById('draw_feed').value    = s.draw_feed;
+    document.getElementById('draw_feed_v').textContent  = s.draw_feed;
+    document.getElementById('travel_feed').value  = s.travel_feed;
+    document.getElementById('travel_feed_v').textContent = s.travel_feed;
+    document.getElementById('conf').value         = s.conf;
+    document.getElementById('conf_v').textContent = parseFloat(s.conf).toFixed(2);
+    document.getElementById('auto_trigger_seconds').value = s.auto_trigger_seconds;
+    document.getElementById('pose_seconds').value = s.pose_seconds;
+    document.getElementById('pen_up_z').value     = s.pen_up_z;
+    document.getElementById('pen_down_z').value   = s.pen_down_z;
+    document.getElementById('plotter_type').value = s.plotter_type;
+    document.getElementById('usb_port').value     = s.usb_port;
+    document.getElementById('baud_rate').value    = s.baud_rate;
+    updatePlotterNote();
+  } catch (e) {}
+}
+
+loadSettings();
+pollStatus();
+</script>
+</body>
+</html>
