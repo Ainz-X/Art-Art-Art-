@@ -9,7 +9,7 @@ import os
 try:
     from ultralytics import YOLO
 except ImportError:
-    print("错误：未找到 ultralytics。")
+    print("Error: ultralytics not found.")
     exit(1)
 
 def build_arg_parser():
@@ -19,7 +19,7 @@ def build_arg_parser():
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--output", type=str, default="output/pi_draw.svg")
     parser.add_argument("--model", type=str, default="yolov8n-seg.pt")
-    parser.add_argument("--conf", type=float, default=0.25) # 降低默认阈值提高灵敏度
+    parser.add_argument("--conf", type=float, default=0.25) # Lower default threshold to increase sensitivity
     parser.add_argument("--auto-trigger-seconds", type=float, default=2.0)
     parser.add_argument("--pose-seconds", type=float, default=5.0)
     return parser
@@ -45,7 +45,7 @@ def main():
     cap.set(3, args.width)
     cap.set(4, args.height)
 
-    # --- 还原为普通窗口，解决拉伸问题 ---
+    # --- Restore normal window to fix stretching issues ---
     win_name = "AI Art System"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win_name, 1280, 720)
@@ -53,18 +53,18 @@ def main():
     person_seen_start = None
     pose_deadline = None
     
-    print("视觉增强版已就绪。正在运行...")
+    print("Vision enhancement ready. Running...")
 
     while True:
         ok, frame = cap.read()
         if not ok: break
         
-        # 移除了严格的 classes=[0] 过滤，增加容错
+        # Removed strict classes=[0] filter to increase tolerance
         results = model.predict(source=frame, conf=args.conf, verbose=False)[0]
         preview = frame.copy()
         now = time.time()
         
-        # 兼容性检测：只要有框或者有掩码都算检测到
+        # Compatibility detection: consider detected if there is a box or a mask
         has_detection = len(results.boxes) > 0
         
         if pose_deadline:
@@ -72,12 +72,12 @@ def main():
             if left > 0:
                 cv2.putText(preview, f"CAPTURING: {left:.1f}s", (50, 100), 2, 2, (0, 255, 255), 3)
             else:
-                # 倒计时结束，必须抓拍
-                print("📸 捕捉照片中...")
+                # Countdown finished — capture now
+                print("📸 Capturing photo...")
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 target_svg = Path(args.output).with_name(f"pi_draw_{ts}.svg")
                 
-                # 尝试提取轮廓
+                # Try extracting contours
                 found_shape = False
                 if results.masks is not None:
                     masks = results.masks.data.cpu().numpy()
@@ -94,19 +94,19 @@ def main():
                     cap.release()
                     cv2.destroyAllWindows()
                     
-                    print(f"✅ SVG已生成: {target_svg}")
+                    print(f"SVG generated: {target_svg}")
                     target_gcode = target_svg.with_suffix(".ngc")
                     
-                    print("🚀 正在自动转换 G-code...")
+                    print("Automatically converting to G-code...")
                     subprocess.run(["python3", "svg-G-code.py", str(target_svg), str(target_gcode)])
                     
-                    print("✍️ 启动绘图机...")
+                    print("Starting plotter...")
                     subprocess.run(["python3", "send.py", str(target_gcode)])
                     
-                    print("🎉 绘图已启动，程序退出。")
+                    print("Plotting started, exiting program.")
                     return
                 else:
-                    print("❌ 未能捕捉到清晰轮廓，重置。")
+                    print("Failed to capture a clear contour, resetting.")
                     pose_deadline = None
                     person_seen_start = None
 
